@@ -1,0 +1,51 @@
+{
+  "title": "herdr/<node>: what one machine's herdr runs, written by herdr-kharka",
+  "type": "object",
+  "required": ["host", "herdr", "focused", "workspaces", "agents"],
+  "properties": {
+    "host": { "type": "string" },
+    "label": { "type": "string" },
+    "herdr": { "enum": ["online", "offline"] },
+    "origin_machine_id": { "type": ["string", "null"] },
+    "focused": { "type": ["string", "null"] },
+    "focus_changed": { "type": ["integer", "null"], "minimum": 0 },
+    "workspaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "number", "label"],
+        "properties": {
+          "id": { "type": "string" },
+          "number": { "type": "integer", "minimum": 0 },
+          "label": { "type": "string" },
+          "tokens": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      }
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pane", "workspace", "status", "since"],
+        "properties": {
+          "pane": { "type": "string", "minLength": 1 },
+          "terminal_id": { "type": ["string", "null"] },
+          "display_agent": { "type": ["string", "null"] },
+          "origin_machine_id": { "type": ["string", "null"] },
+          "workspace": { "type": "string" },
+          "tab": { "type": "string" },
+          "name": { "type": ["string", "null"] },
+          "agent": { "type": "string" },
+          "status": { "enum": ["working", "blocked", "done", "idle", "unknown"] },
+          "since": { "type": "integer", "minimum": 0 },
+          "title": { "type": ["string", "null"] },
+          "session": { "type": ["string", "null"] },
+          "context_tokens": { "type": ["integer", "null"], "minimum": 0 },
+          "cwd": { "type": "string" },
+          "branch": { "type": ["string", "null"] },
+          "tokens": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

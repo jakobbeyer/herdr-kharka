@@ -1,0 +1,660 @@
+//! herdr-kharka against a fake herdr and a fake kharka daemon, both on Unix sockets in a throw-away folder.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-kharka");
+
+/// How the fake herdr treats a request.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Answer,
+    /// `agent.list` fails this many more times, then herdr answers again.
+    FailNext(u32),
+    FailAlways,
+}
+
+/// A herdr that answers `agent.list` and `workspace.list` from `agents`, and keeps every event subscription open so
+/// that the test can send events (or close them, as a restarting herdr does).
+struct FakeHerdr {
+    agents: Arc<Mutex<Value>>,
+    subscribers: Arc<Mutex<Vec<UnixStream>>>,
+    /// Every `events.subscribe` request's subscriptions, refused ones too.
+    subscriptions: Arc<Mutex<Vec<Value>>>,
+    mode: Arc<Mutex<Mode>>,
+    /// The event types this herdr knows; it refuses a subscription that names another one. None: every type.
+    known_events: Arc<Mutex<Option<Vec<String>>>>,
+    socket: PathBuf,
+}
+
+impl FakeHerdr {
+    fn start(dir: &Path, agents: Value) -> FakeHerdr {
+        let socket = dir.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let herdr = FakeHerdr {
+            agents: Arc::new(Mutex::new(agents)),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            subscriptions: Arc::new(Mutex::new(Vec::new())),
+            mode: Arc::new(Mutex::new(Mode::Answer)),
+            known_events: Arc::new(Mutex::new(None)),
+            socket,
+        };
+        let (state, subs, requests, mode, known) = (
+            herdr.agents.clone(),
+            herdr.subscribers.clone(),
+            herdr.subscriptions.clone(),
+            herdr.mode.clone(),
+            herdr.known_events.clone(),
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let answer = match request["method"].as_str().unwrap() {
+                    "agent.list" => {
+                        let mut mode = mode.lock().unwrap();
+                        match *mode {
+                            Mode::Answer => Ok(json!({
+                                "type": "agent_list",
+                                "origin_machine_id": "machine_local",
+                                "agents": state.lock().unwrap().clone()
+                            })),
+                            Mode::FailNext(times) => {
+                                *mode = if times > 1 {
+                                    Mode::FailNext(times - 1)
+                                } else {
+                                    Mode::Answer
+                                };
+                                Err("busy")
+                            }
+                            Mode::FailAlways => Err("busy"),
+                        }
+                    }
+                    "workspace.list" => Ok(json!({ "workspaces": [
+                        {
+                            "workspace_id": "w1", "label": "repo", "number": 1, "focused": false, "pane_count": 2,
+                            "tokens": { "tests": "◌ 3/40", "spin": "✻" }
+                        },
+                        {
+                            "workspace_id": "remote1/w5", "label": "api", "number": 1, "focused": true,
+                            "machine_id": "remote1", "machine_profile_id": "remote1", "machine_label": "Remote"
+                        }
+                    ] })),
+                    "events.subscribe" => {
+                        let subscriptions = request["params"]["subscriptions"].clone();
+                        requests.lock().unwrap().push(subscriptions.clone());
+                        let unknown = known.lock().unwrap().as_ref().and_then(|known| {
+                            subscriptions.as_array().unwrap().iter().find_map(|subscription| {
+                                let kind = subscription["type"].as_str().unwrap();
+                                (!known.iter().any(|k| k == kind)).then(|| kind.to_string())
+                            })
+                        });
+                        match unknown {
+                            Some(kind) => {
+                                let mut stream = stream;
+                                let _ = writeln!(
+                                    stream,
+                                    "{}",
+                                    json!({ "id": request["id"], "error": {
+                                        "code": "invalid_request",
+                                        "message": format!("invalid request: unknown variant `{kind}`")
+                                    } })
+                                );
+                                continue;
+                            }
+                            None => {
+                                subs.lock().unwrap().push(stream.try_clone().unwrap());
+                                Ok(json!({ "type": "subscription_started" }))
+                            }
+                        }
+                    }
+                    other => panic!("unexpected {other}"),
+                };
+                let mut stream = stream;
+                let message = match answer {
+                    Ok(result) => json!({ "id": request["id"], "result": result }),
+                    Err(message) => json!({ "id": request["id"], "error": { "code": "busy", "message": message } }),
+                };
+                let _ = writeln!(stream, "{message}");
+            }
+        });
+        herdr
+    }
+
+    fn set_agents(&self, agents: Value) {
+        *self.agents.lock().unwrap() = agents;
+    }
+
+    fn set_mode(&self, mode: Mode) {
+        *self.mode.lock().unwrap() = mode;
+    }
+
+    fn send_event(&self) {
+        for stream in self.subscribers.lock().unwrap().iter_mut() {
+            let _ = writeln!(
+                stream,
+                "{}",
+                json!({ "event": "pane.agent_status_changed", "data": {} })
+            );
+        }
+    }
+
+    /// Closes every event subscription, as herdr does when it restarts.
+    fn close_subscriptions(&self) {
+        for stream in self.subscribers.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn subscribed(&self) -> bool {
+        !self.subscribers.lock().unwrap().is_empty()
+    }
+
+    fn wait_subscribed(&self) {
+        for _ in 0..300 {
+            if self.subscribed() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("herdr-kharka did not subscribe to herdr's events");
+    }
+
+    fn subscription_requests(&self) -> Vec<Value> {
+        self.subscriptions.lock().unwrap().clone()
+    }
+}
+
+/// How the fake kharka daemon answers.
+#[derive(Clone, Copy, PartialEq)]
+enum Daemon {
+    Answer,
+    /// Every put is refused, as a hub does with a value that does not fit the schema.
+    RefusePuts,
+    /// Takes requests and never answers.
+    Hang,
+}
+
+/// A kharka daemon that knows its name and hands every put to the test; `whoamis` counts the connections that asked
+/// for the name.
+struct FakeKharka {
+    socket: PathBuf,
+    puts: Receiver<(String, Value)>,
+    whoamis: Arc<Mutex<u32>>,
+}
+
+fn fake_kharka(dir: &Path) -> (PathBuf, Receiver<(String, Value)>) {
+    let kharka = fake_kharka_with(dir, Daemon::Answer);
+    (kharka.socket, kharka.puts)
+}
+
+fn fake_kharka_with(dir: &Path, daemon: Daemon) -> FakeKharka {
+    let socket = dir.join("kharka.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (puts, received) = mpsc::channel();
+    let whoamis = Arc::new(Mutex::new(0));
+    let counted = whoamis.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let puts = puts.clone();
+            let counted = counted.clone();
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    if daemon == Daemon::Hang {
+                        continue;
+                    }
+                    let answer = match request["op"].as_str().unwrap() {
+                        "whoami" => {
+                            *counted.lock().unwrap() += 1;
+                            json!({ "id": request["id"], "ok": true, "node": "mac" })
+                        }
+                        "put" => {
+                            let key = request["key"].as_str().unwrap().to_string();
+                            let _ = puts.send((key, request["value"].clone()));
+                            if daemon == Daemon::RefusePuts {
+                                json!({ "id": request["id"], "ok": false, "error": "does not fit the schema" })
+                            } else {
+                                json!({ "id": request["id"], "ok": true, "entry": {} })
+                            }
+                        }
+                        other => panic!("unexpected {other}"),
+                    };
+                    let _ = writeln!(writer, "{answer}");
+                }
+            });
+        }
+    });
+    FakeKharka {
+        socket,
+        puts: received,
+        whoamis,
+    }
+}
+
+/// Every put that arrives within `within`.
+fn puts_within(puts: &Receiver<(String, Value)>, within: Duration) -> Vec<Value> {
+    let until = Instant::now() + within;
+    let mut values = Vec::new();
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match puts.recv_timeout(left) {
+            Ok((_, value)) => values.push(value),
+            Err(_) => break,
+        }
+    }
+    values
+}
+
+fn agent(pane: &str, status: &str) -> Value {
+    json!({
+        "pane_id": pane,
+        "terminal_id": "term_1",
+        "display_agent": "C2",
+        "origin_machine_id": "machine_local",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "name": "repo-1",
+        "agent": "claude",
+        "agent_status": status,
+        "status_since_unix_ms": 1791556115452u64,
+        "focused": true,
+        "revision": 81392,
+        "composer": { "state": "unknown" },
+        "terminal_title": "✳ Fix the export",
+        "terminal_title_stripped": "Fix the export",
+        "cwd": "/nowhere",
+        "tokens": { "spin": "✻ working", "repo": "github.com/x/y" }
+    })
+}
+
+fn collector(herdr: &Path, kharka: &Path, extra: &[&str]) -> Command {
+    let mut command = Command::new(BIN);
+    command
+        .arg("--herdr-socket")
+        .arg(herdr)
+        .arg("--kharka-socket")
+        .arg(kharka)
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn once_writes_this_machines_agents_without_the_noise() {
+    let dir = tempfile::tempdir().unwrap();
+    let federated = json!({
+        "pane_id": "other/w1:p1", "machine_profile_id": "other", "machine_id": "other",
+        "origin_machine_id": "machine_other", "agent_status": "idle"
+    });
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working"), federated]));
+    let (kharka, puts) = fake_kharka(dir.path());
+
+    let status = collector(&herdr.socket, &kharka, &["--once"]).status().unwrap();
+    assert!(status.success());
+    let (key, value) = puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(key, "herdr/mac");
+    assert_eq!(value["herdr"], "online");
+    assert_eq!(value["label"], "mac", "the label is the node name by default");
+    assert_eq!(value["origin_machine_id"], "machine_local");
+    assert_eq!(value["focus_changed"], Value::Null, "no change seen in a single look");
+    assert_eq!(value["workspaces"][0]["label"], "repo");
+    let agents = value["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "only this machine's agents");
+    assert_eq!(
+        agents[0],
+        json!({
+            "pane": "w1:p1",
+            "terminal_id": "term_1",
+            "display_agent": "C2",
+            "origin_machine_id": "machine_local",
+            "workspace": "w1",
+            "tab": "w1:t1",
+            "name": "repo-1",
+            "agent": "claude",
+            "status": "working",
+            "since": 1791556115452u64,
+            "title": "Fix the export",
+            "session": null,
+            "context_tokens": null,
+            "cwd": "/nowhere",
+            "branch": null,
+            "tokens": { "repo": "github.com/x/y" }
+        })
+    );
+    assert_eq!(value["focused"], "w1:p1");
+    assert_eq!(
+        value["workspaces"],
+        json!([{ "id": "w1", "number": 1, "label": "repo", "tokens": { "tests": "◌ 3/40" } }]),
+        "only this machine's workspaces, their tokens without the ignored spin"
+    );
+}
+
+#[test]
+fn the_label_can_be_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    let status = collector(&herdr.socket, &kharka, &["--once", "--label", "Work Mac"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (key, value) = puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(key, "herdr/mac", "the key keeps the node name");
+    assert_eq!(value["label"], "Work Mac");
+}
+
+#[test]
+fn a_herdr_event_brings_the_change_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    // looking only every minute: the change below can only come through the event
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "60s", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    let (_, first) = puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first["agents"][0]["status"], "working");
+    herdr.wait_subscribed();
+    let kinds: Vec<Value> = herdr.subscription_requests()[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|subscription| subscription["type"].clone())
+        .collect();
+    for kind in [
+        "workspace.moved",
+        "workspace.reordered",
+        "workspace.metadata_updated",
+        "tab.moved",
+    ] {
+        assert!(kinds.contains(&json!(kind)), "subscribed to {kind}");
+    }
+    assert!(!kinds.contains(&json!("pane.updated")), "not to every frame of a title");
+
+    herdr.set_agents(json!([agent("w1:p1", "done")]));
+    herdr.send_event();
+    let (_, changed) = puts.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(changed["agents"][0]["status"], "done");
+
+    // an event without a change writes nothing
+    herdr.send_event();
+    assert!(puts.recv_timeout(Duration::from_millis(500)).is_err());
+}
+
+#[test]
+fn herdr_away_is_written_as_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (kharka, puts) = fake_kharka(dir.path());
+    let status = collector(&dir.path().join("missing.sock"), &kharka, &["--once"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (_, value) = puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(value["herdr"], "offline");
+    assert_eq!(value["agents"], json!([]));
+}
+
+#[test]
+fn without_a_kharka_daemon_once_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let output = collector(&herdr.socket, &dir.path().join("none.sock"), &["--once"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no kharka daemon"));
+}
+
+#[test]
+fn a_status_readers_do_not_know_becomes_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "thinking")]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    assert!(
+        collector(&herdr.socket, &kharka, &["--once"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (_, value) = puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(value["agents"][0]["status"], "unknown");
+}
+
+#[test]
+fn an_older_herdr_gets_the_events_it_knows() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    let legacy = [
+        "pane.created",
+        "pane.closed",
+        "pane.exited",
+        "pane.moved",
+        "pane.focused",
+        "pane.agent_detected",
+        "pane.agent_status_changed",
+        "workspace.renamed",
+        "workspace.closed",
+    ];
+    *herdr.known_events.lock().unwrap() = Some(legacy.iter().map(|kind| kind.to_string()).collect());
+    let (kharka, puts) = fake_kharka(dir.path());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "60s", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    herdr.wait_subscribed();
+    assert_eq!(
+        herdr.subscription_requests().len(),
+        2,
+        "refused once, then the events herdr knows"
+    );
+
+    herdr.set_agents(json!([agent("w1:p1", "done")]));
+    herdr.send_event();
+    let (_, changed) = puts.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(changed["agents"][0]["status"], "done");
+}
+
+#[test]
+fn a_closed_subscription_is_opened_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "60s", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    herdr.wait_subscribed();
+
+    // herdr restarts: the subscription ends, herdr-kharka notices and subscribes again (after a second: it ended early)
+    herdr.close_subscriptions();
+    thread::sleep(Duration::from_millis(100));
+    herdr.wait_subscribed();
+    assert_eq!(herdr.subscription_requests().len(), 2);
+
+    herdr.set_agents(json!([agent("w1:p1", "done")]));
+    herdr.send_event();
+    let (_, changed) = puts.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        changed["agents"][0]["status"], "done",
+        "the new subscription brings events"
+    );
+}
+
+#[test]
+fn a_refused_subscription_is_asked_for_again_with_a_growing_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    // a herdr that knows none of the events refuses every subscription, also the older one
+    *herdr.known_events.lock().unwrap() = Some(Vec::new());
+    let (kharka, _puts) = fake_kharka(dir.path());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "100ms", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    thread::sleep(Duration::from_millis(3500));
+    // looking every 100 ms; asked again after 1 s and 2 s, not on every look: the full set, the older set, and two
+    let asked = herdr.subscription_requests().len();
+    assert!((3..=5).contains(&asked), "asked {asked} times");
+}
+
+#[test]
+fn one_failed_look_keeps_the_last_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    // looking only on events, so that each look below is one event
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "60s", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    herdr.wait_subscribed();
+
+    herdr.set_mode(Mode::FailNext(1));
+    herdr.send_event();
+    assert!(
+        puts_within(&puts, Duration::from_millis(500)).is_empty(),
+        "one failure writes nothing"
+    );
+
+    herdr.set_mode(Mode::FailAlways);
+    for _ in 0..2 {
+        herdr.send_event();
+        thread::sleep(Duration::from_millis(200));
+    }
+    let written = puts_within(&puts, Duration::from_millis(500));
+    assert!(written.iter().all(|value| value["herdr"] == "offline"));
+    assert_eq!(written.len(), 1, "offline after three failures in a row");
+    assert_eq!(written[0]["agents"], json!([]));
+}
+
+#[test]
+fn herdr_gone_is_written_as_offline_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "60s", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    herdr.wait_subscribed();
+
+    std::fs::remove_file(&herdr.socket).unwrap();
+    herdr.send_event();
+    let (_, value) = puts.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(value["herdr"], "offline", "no socket: no waiting");
+}
+
+#[test]
+fn a_change_of_focus_is_stamped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut second = agent("w1:p2", "idle");
+    second["focused"] = json!(false);
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working"), second.clone()]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "60s", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    let (_, first) = puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first["focused"], "w1:p1");
+    assert_eq!(first["focus_changed"], Value::Null);
+    herdr.wait_subscribed();
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut first_agent = agent("w1:p1", "working");
+    first_agent["focused"] = json!(false);
+    second["focused"] = json!(true);
+    herdr.set_agents(json!([first_agent, second]));
+    herdr.send_event();
+    let (_, changed) = puts.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(changed["focused"], "w1:p2");
+    let stamp = changed["focus_changed"].as_u64().expect("a time");
+    assert!(stamp >= before && stamp < before + 5000);
+}
+
+#[test]
+fn a_refused_write_keeps_the_connection_and_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::RefusePuts);
+    let mut running = collector(
+        &herdr.socket,
+        &kharka.socket,
+        &["--interval", "100ms", "--heartbeat", "1s"],
+    )
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    // the state changes on every look, so every look would write
+    for round in 0..25 {
+        let status = if round % 2 == 0 { "working" } else { "idle" };
+        herdr.set_agents(json!([agent("w1:p1", status)]));
+        thread::sleep(Duration::from_millis(100));
+    }
+    running.kill().unwrap();
+    let output = running.wait_with_output().unwrap();
+    let attempts = puts_within(&kharka.puts, Duration::from_millis(10)).len();
+    assert!(
+        (2..=4).contains(&attempts),
+        "tried again after the heartbeat only: {attempts}"
+    );
+    assert_eq!(*kharka.whoamis.lock().unwrap(), 1, "one connection");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(log.matches("does not fit the schema").count(), 1, "logged once: {log}");
+    assert_eq!(log.matches("herdr-kharka: writing herdr/mac\n").count(), 1, "{log}");
+}
+
+#[test]
+fn a_hanging_kharka_daemon_does_not_hold_up_the_collector() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Hang);
+    let started = Instant::now();
+    let output = collector(&herdr.socket, &kharka.socket, &["--once"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(15), "gave up after the timeout");
+}

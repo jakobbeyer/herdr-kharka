@@ -1,0 +1,7 @@
+# The collection for herdr-kharka, for the hub's ~/.config/kharka/kharka.toml (with herdr.schema.json next to it):
+# each machine writes only herdr/<its node>, an entry not refreshed within 30 s reads as stale, and every write must fit
+# the schema.
+[collections.herdr]
+kind = "state"
+ttl = "30s"
+schema = "herdr.schema.json"

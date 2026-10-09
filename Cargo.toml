@@ -1,0 +1,17 @@
+[package]
+name = "herdr-kharka"
+version = "0.0.1"
+edition = "2024"
+description = "Writes what a machine's herdr runs into kharka, on every change"
+license = "MIT"
+repository = "https://github.com/jakobbeyer/herdr-kharka"
+keywords = ["herdr", "kharka", "agents", "claude"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+gethostname = "1.1.0"
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tempfile = "3.27.0"
