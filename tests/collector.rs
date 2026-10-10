@@ -705,6 +705,7 @@ fn a_refused_write_keeps_the_connection_and_waits() {
     let dir = tempfile::tempdir().unwrap();
     let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
     let kharka = fake_kharka_with(dir.path(), Daemon::RefusePuts);
+    let started = Instant::now();
     let mut running = collector(
         &herdr.socket,
         &kharka.socket,
@@ -720,11 +721,13 @@ fn a_refused_write_keeps_the_connection_and_waits() {
         thread::sleep(Duration::from_millis(100));
     }
     running.kill().unwrap();
+    // once at the start and once per heartbeat; a slow machine takes longer for the rounds, so the bound follows the time
+    let most = started.elapsed().as_secs() as usize + 2;
     let output = running.wait_with_output().unwrap();
     let attempts = puts_within(&kharka.puts, Duration::from_millis(10)).len();
     assert!(
-        (2..=4).contains(&attempts),
-        "tried again after the heartbeat only: {attempts}"
+        (2..=most).contains(&attempts),
+        "tried again after the heartbeat only: {attempts} (at most {most})"
     );
     assert_eq!(*kharka.whoamis.lock().unwrap(), 1, "one connection");
     let log = String::from_utf8_lossy(&output.stderr);
