@@ -1,7 +1,14 @@
-# The collection for herdr-kharka, for the hub's ~/.config/kharka/kharka.toml (with herdr.schema.json next to it):
-# each machine writes only herdr/<its node>, an entry not refreshed within 30 s reads as stale, and every write must fit
-# the schema.
+# The collections for herdr-kharka, for the hub's ~/.config/kharka/kharka.toml (with the schemas next to it).
+#
+# herdr: each machine writes only herdr/<its node>, an entry not refreshed within 30 s reads as stale, and every write
+# must fit the schema.
 [collections.herdr]
 kind = "state"
 ttl = "30s"
 schema = "herdr.schema.json"
+
+# herdr.commands: any machine writes a command for another one's herdr (herdr.commands/<node>/<id>), herdr-kharka there
+# answers it in the same record.
+[collections."herdr.commands"]
+kind = "record"
+schema = "herdr.commands.schema.json"

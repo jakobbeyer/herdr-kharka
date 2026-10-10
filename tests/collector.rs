@@ -32,6 +32,8 @@ struct FakeHerdr {
     mode: Arc<Mutex<Mode>>,
     /// The event types this herdr knows; it refuses a subscription that names another one. None: every type.
     known_events: Arc<Mutex<Option<Vec<String>>>>,
+    /// Every other request (method, params), answered with `{}`, or refused when the target is `missing`.
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
     socket: PathBuf,
 }
 
@@ -45,14 +47,16 @@ impl FakeHerdr {
             subscriptions: Arc::new(Mutex::new(Vec::new())),
             mode: Arc::new(Mutex::new(Mode::Answer)),
             known_events: Arc::new(Mutex::new(None)),
+            calls: Arc::new(Mutex::new(Vec::new())),
             socket,
         };
-        let (state, subs, requests, mode, known) = (
+        let (state, subs, requests, mode, known, calls) = (
             herdr.agents.clone(),
             herdr.subscribers.clone(),
             herdr.subscriptions.clone(),
             herdr.mode.clone(),
             herdr.known_events.clone(),
+            herdr.calls.clone(),
         );
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -120,7 +124,17 @@ impl FakeHerdr {
                             }
                         }
                     }
-                    other => panic!("unexpected {other}"),
+                    other => {
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push((other.to_string(), request["params"].clone()));
+                        if request["params"]["target"] == "missing" {
+                            Err("pane not found")
+                        } else {
+                            Ok(json!({}))
+                        }
+                    }
                 };
                 let mut stream = stream;
                 let message = match answer {
@@ -175,6 +189,10 @@ impl FakeHerdr {
     fn subscription_requests(&self) -> Vec<Value> {
         self.subscriptions.lock().unwrap().clone()
     }
+
+    fn calls(&self) -> Vec<(String, Value)> {
+        self.calls.lock().unwrap().clone()
+    }
 }
 
 /// How the fake kharka daemon answers.
@@ -187,12 +205,42 @@ enum Daemon {
     Hang,
 }
 
-/// A kharka daemon that knows its name and hands every put to the test; `whoamis` counts the connections that asked
-/// for the name.
+/// A kharka daemon that knows its name and hands every put and del to the test (a del as a put of null);
+/// `whoamis` counts the connections that asked for the name. A watch is answered and kept, with no entries: the test
+/// sends them with `change`.
 struct FakeKharka {
     socket: PathBuf,
     puts: Receiver<(String, Value)>,
     whoamis: Arc<Mutex<u32>>,
+    watches: Arc<Mutex<Vec<(String, Value, UnixStream)>>>,
+}
+
+impl FakeKharka {
+    fn wait_watched(&self, prefix: &str) {
+        for _ in 0..300 {
+            if self
+                .watches
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(watched, _, _)| watched == prefix)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("nobody watches {prefix}");
+    }
+
+    /// Sends an entry to every watch whose prefix it starts with.
+    fn change(&self, entry: Value) {
+        let key = entry["key"].as_str().unwrap().to_string();
+        for (prefix, id, stream) in self.watches.lock().unwrap().iter_mut() {
+            if key.starts_with(prefix.as_str()) {
+                let _ = writeln!(stream, "{}", json!({ "id": id, "event": "change", "entry": entry }));
+            }
+        }
+    }
 }
 
 fn fake_kharka(dir: &Path) -> (PathBuf, Receiver<(String, Value)>) {
@@ -205,11 +253,14 @@ fn fake_kharka_with(dir: &Path, daemon: Daemon) -> FakeKharka {
     let listener = UnixListener::bind(&socket).unwrap();
     let (puts, received) = mpsc::channel();
     let whoamis = Arc::new(Mutex::new(0));
+    let watches = Arc::new(Mutex::new(Vec::new()));
     let counted = whoamis.clone();
+    let watching = watches.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let puts = puts.clone();
             let counted = counted.clone();
+            let watching = watching.clone();
             thread::spawn(move || {
                 let mut writer = stream.try_clone().unwrap();
                 for line in BufReader::new(stream).lines() {
@@ -232,6 +283,19 @@ fn fake_kharka_with(dir: &Path, daemon: Daemon) -> FakeKharka {
                                 json!({ "id": request["id"], "ok": true, "entry": {} })
                             }
                         }
+                        "del" => {
+                            let _ = puts.send((request["key"].as_str().unwrap().to_string(), Value::Null));
+                            json!({ "id": request["id"], "ok": true, "entry": null })
+                        }
+                        "watch" => {
+                            let _ = writeln!(writer, "{}", json!({ "id": request["id"], "ok": true }));
+                            let prefix = request["prefix"].as_str().unwrap().to_string();
+                            watching
+                                .lock()
+                                .unwrap()
+                                .push((prefix, request["id"].clone(), writer.try_clone().unwrap()));
+                            continue;
+                        }
                         other => panic!("unexpected {other}"),
                     };
                     let _ = writeln!(writer, "{answer}");
@@ -243,6 +307,7 @@ fn fake_kharka_with(dir: &Path, daemon: Daemon) -> FakeKharka {
         socket,
         puts: received,
         whoamis,
+        watches,
     }
 }
 
@@ -621,7 +686,7 @@ fn a_refused_write_keeps_the_connection_and_waits() {
     let mut running = collector(
         &herdr.socket,
         &kharka.socket,
-        &["--interval", "100ms", "--heartbeat", "1s"],
+        &["--interval", "100ms", "--heartbeat", "1s", "--no-commands"],
     )
     .stderr(Stdio::piped())
     .spawn()
@@ -657,4 +722,127 @@ fn a_hanging_kharka_daemon_does_not_hold_up_the_collector() {
         .unwrap();
     assert!(!output.status.success());
     assert!(started.elapsed() < Duration::from_secs(15), "gave up after the timeout");
+}
+
+/// A command for this machine, as another machine writes it.
+fn command(id: &str, method: &str, params: Value, expires_in_ms: i64) -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    json!({
+        "key": format!("herdr.commands/mac/{id}"),
+        "hlc": format!("{now}-0-server"),
+        "value": { "from": "server", "at": now, "expires": now + expires_in_ms, "method": method, "params": params }
+    })
+}
+
+/// The answers written to herdr.commands/ within `within`, by key.
+fn answers_within(puts: &Receiver<(String, Value)>, within: Duration) -> Vec<(String, Value)> {
+    let until = Instant::now() + within;
+    let mut answers = Vec::new();
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match puts.recv_timeout(left) {
+            Ok((key, value)) if key.starts_with("herdr.commands/") => answers.push((key, value)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    answers
+}
+
+#[test]
+fn a_command_runs_against_herdr_and_is_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let _running = Killed(collector(&herdr.socket, &kharka.socket, &[]).spawn().unwrap());
+    kharka.wait_watched("herdr.commands/mac/");
+    let sent = command(
+        "server-1",
+        "agent.send_keys",
+        json!({ "target": "w1:p1", "keys": ["esc"] }),
+        15000,
+    );
+    kharka.change(sent.clone());
+    let answers = answers_within(&kharka.puts, Duration::from_secs(2));
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    let (key, answer) = &answers[0];
+    assert_eq!(key, "herdr.commands/mac/server-1");
+    assert_eq!(answer["method"], "agent.send_keys", "the command stays");
+    assert_eq!(answer["done"]["ok"], true);
+    assert_eq!(answer["done"]["result"], json!({}));
+    assert_eq!(
+        herdr.calls(),
+        vec![(
+            "agent.send_keys".to_string(),
+            json!({ "target": "w1:p1", "keys": ["esc"] })
+        )]
+    );
+
+    // the answer comes back through the watch and is not run again
+    let mut echoed = sent.clone();
+    echoed["value"] = answer.clone();
+    kharka.change(echoed);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(herdr.calls().len(), 1);
+}
+
+#[test]
+fn herdrs_error_is_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let _running = Killed(collector(&herdr.socket, &kharka.socket, &[]).spawn().unwrap());
+    kharka.wait_watched("herdr.commands/mac/");
+    kharka.change(command(
+        "server-2",
+        "agent.focus",
+        json!({ "target": "missing" }),
+        15000,
+    ));
+    let answers = answers_within(&kharka.puts, Duration::from_secs(2));
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].1["done"]["ok"], false);
+    assert_eq!(answers[0].1["done"]["error"], "agent.focus: pane not found");
+}
+
+#[test]
+fn only_agent_methods_run_and_only_before_they_expire() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let _running = Killed(collector(&herdr.socket, &kharka.socket, &[]).spawn().unwrap());
+    kharka.wait_watched("herdr.commands/mac/");
+    kharka.change(command(
+        "server-3",
+        "pane.send_text",
+        json!({ "target": "w1:p1", "text": "rm -rf ~" }),
+        15000,
+    ));
+    kharka.change(command("server-4", "agent.focus", json!({ "target": "w1:p1" }), -1000));
+    let answers = answers_within(&kharka.puts, Duration::from_secs(2));
+    let errors: Vec<&Value> = answers.iter().map(|(_, answer)| &answer["done"]["error"]).collect();
+    assert_eq!(
+        errors,
+        [
+            &json!("pane.send_text: not allowed, only agent.* methods"),
+            &json!("expired before it came")
+        ]
+    );
+    assert!(herdr.calls().is_empty(), "nothing ran: {:?}", herdr.calls());
+}
+
+#[test]
+fn without_commands_nothing_watches_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let _running = Killed(
+        collector(&herdr.socket, &kharka.socket, &["--no-commands"])
+            .spawn()
+            .unwrap(),
+    );
+    puts_within(&kharka.puts, Duration::from_millis(500));
+    assert!(kharka.watches.lock().unwrap().is_empty());
 }

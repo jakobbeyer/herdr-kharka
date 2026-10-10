@@ -198,13 +198,18 @@ pub fn branch_of(folder: &Path) -> Option<String> {
 
 /// One request on its own connection, as herdr wants it.
 fn request(socket: &Path, method: &str) -> anyhow::Result<Value> {
+    call(socket, method, &json!({}))
+}
+
+/// Any method with its params, on its own connection: the result, or herdr's error message.
+pub fn call(socket: &Path, method: &str, params: &Value) -> anyhow::Result<Value> {
     let mut stream = UnixStream::connect(socket).with_context(|| format!("no herdr at {}", socket.display()))?;
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     writeln!(
         stream,
         "{}",
-        json!({ "id": "herdr-kharka", "method": method, "params": {} })
+        json!({ "id": "herdr-kharka", "method": method, "params": params })
     )?;
     for line in BufReader::new(stream).lines() {
         let message: Value = serde_json::from_str(&line.with_context(|| format!("{method}: no answer"))?)?;
@@ -212,7 +217,10 @@ fn request(socket: &Path, method: &str) -> anyhow::Result<Value> {
             continue;
         }
         if let Some(error) = message.get("error") {
-            bail!("{method}: {error}");
+            match error["message"].as_str() {
+                Some(text) => bail!("{method}: {text}"),
+                None => bail!("{method}: {error}"),
+            }
         }
         return Ok(message["result"].clone());
     }

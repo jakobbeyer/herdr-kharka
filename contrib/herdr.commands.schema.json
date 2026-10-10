@@ -1,0 +1,21 @@
+{
+  "title": "herdr.commands/<node>/<id>: a command for one machine's herdr, run and answered there by herdr-kharka",
+  "type": "object",
+  "required": ["from", "at", "expires", "method"],
+  "properties": {
+    "from": { "type": "string" },
+    "at": { "type": "integer", "minimum": 0 },
+    "expires": { "type": "integer", "minimum": 0 },
+    "method": { "type": "string", "minLength": 1 },
+    "params": { "type": "object" },
+    "done": {
+      "type": "object",
+      "required": ["at", "ok"],
+      "properties": {
+        "at": { "type": "integer", "minimum": 0 },
+        "ok": { "type": "boolean" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

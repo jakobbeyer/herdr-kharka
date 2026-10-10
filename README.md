@@ -13,13 +13,16 @@ change. With it running on every machine, any tool reads the agents of all machi
   it is current.
 - **Context of Claude sessions:** every Claude agent gets `context_tokens`, the input plus cache tokens of its last
   answer, from its transcript (`~/.claude*/projects/*/<session>.jsonl`), and every agent the git branch of its folder.
+- **Commands from other machines:** it runs the `agent.*` methods other machines write for this one into
+  `herdr.commands/<node>/` against the local herdr and answers them there (see [Commands](#commands)).
 - **Only this machine's agents:** agents and workspaces herdr federates from other machines are left to their own
   machine.
 - **Steady:** a single failed look at herdr (a timeout) keeps the last state; herdr is written as `offline` after three
   failed looks in a row or 10 s, at once only when its socket is gone. A write the kharka daemon refuses keeps the
   connection, is logged once and tried again after the heartbeat; a daemon that hangs is given up on after 5 s.
 
-It talks to herdr's socket and to the local kharka daemon's socket, nothing else.
+It talks to herdr's socket and to the local kharka daemon's socket, nothing else: commands reach other machines
+through kharka, without ssh.
 
 ## Install and run
 
@@ -38,7 +41,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kharka.herdr.plist
 
 Options: `--herdr-socket` (default `$HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`), `--kharka-socket`
 (`$KHARKA_SOCKET`, else kharka's default), `--key` (default `herdr/{node}`), `--label` (default the node name),
-`--interval`, `--heartbeat`, `--ignore-token` (repeatable, default `spin`).
+`--interval`, `--heartbeat`, `--ignore-token` (repeatable, default `spin`), `--no-commands` (run no commands).
 
 ## What it writes
 
@@ -87,14 +90,48 @@ herdr's API objects, so that readers do not break when herdr changes:
 While herdr cannot be reached: `"herdr": "offline"` with empty lists. Readers should ignore fields they do not know:
 new ones are added, none are taken away.
 
-[contrib/](contrib/) has the collection for the hub's `kharka.toml` and its schema, `herdr.schema.json`: each machine
-writes only its own key, an entry not refreshed within the TTL reads as stale, and every write must fit the schema.
+## Commands
+
+A program on any machine (e.g. herdr-deck) has a machine's herdr do something by writing a record for that node:
+
+```json
+herdr.commands/server/mac-1791556120001-1
+{ "from": "mac", "at": 1791556120001, "expires": 1791556135001, "method": "agent.focus", "params": { "target": "w0:p1" } }
+```
+
+herdr-kharka on `server` runs the method against its herdr and writes the answer into the same record, the command
+kept:
+
+```json
+{ …, "done": { "at": 1791556120240, "ok": true, "result": { … } } }
+{ …, "done": { "at": 1791556120240, "ok": false, "error": "agent.focus: pane not found" } }
+```
+
+The sender reads the answer from its watch and deletes the record. herdr-kharka writes the answer only if the record is
+unchanged since it read it (a sender that gave up and deleted it gets nothing back), and deletes answers nobody took after
+a minute.
+
+- **Every `agent.*` method** runs (focus, rename, send keys, prompt …), any other one is answered `not allowed`.
+  Whoever can write to kharka can steer the agents of every machine: `--no-commands` turns it off on a machine.
+- **`expires`** (ms): a command that comes later, e.g. to a machine that was offline, is answered `expired` and does
+  not run. The clocks of the machines should agree to within a few seconds.
+- An id that stays unique on the sending machine is enough, e.g. `<node>-<ms>-<counter>`.
+
+## The hub's collections
+
+[contrib/](contrib/) has the collections for the hub's `kharka.toml` and their schemas: for `herdr`, each machine
+writes only its own key, an entry not refreshed within the TTL reads as stale, and every write must fit
+`herdr.schema.json`; any machine writes `herdr.commands`, fitting `herdr.commands.schema.json`.
 
 ```toml
 [collections.herdr]
 kind = "state"
 ttl = "30s"
 schema = "herdr.schema.json"
+
+[collections."herdr.commands"]
+kind = "record"
+schema = "herdr.commands.schema.json"
 ```
 
 ## Reading it

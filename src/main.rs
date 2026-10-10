@@ -2,8 +2,9 @@
 //!
 //! It looks at herdr when herdr reports an event, and every `--interval` anyway, and writes `herdr/<node>` to the local
 //! kharka daemon when the state changed, or every `--heartbeat` so readers can tell it is current. kharka carries it to
-//! every other machine.
+//! every other machine. It also runs the `agent.*` commands other machines write for this one (see [`commands`]).
 
+mod commands;
 mod context;
 mod herdr;
 mod kharka;
@@ -55,6 +56,9 @@ struct Cli {
     /// Look once, write, and end
     #[arg(long)]
     once: bool,
+    /// Do not run the agent.* commands that other machines write to herdr.commands/<node>/
+    #[arg(long)]
+    no_commands: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -100,12 +104,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         eprintln!("Install it:\n{}", service::instructions());
         return Ok(());
     }
-    let mut herdr = Watcher::new(
-        cli.herdr_socket.unwrap_or_else(herdr::default_socket),
-        cli.ignore_tokens,
-    );
+    let herdr_socket = cli.herdr_socket.unwrap_or_else(herdr::default_socket);
+    let kharka_socket = cli.kharka_socket.unwrap_or_else(kharka::default_socket);
+    if !cli.once && !cli.no_commands {
+        commands::spawn(kharka_socket.clone(), herdr_socket.clone());
+    }
+    let mut herdr = Watcher::new(herdr_socket, cli.ignore_tokens);
     let mut collector = Collector {
-        kharka_socket: cli.kharka_socket.unwrap_or_else(kharka::default_socket),
+        kharka_socket,
         key_pattern: cli.key,
         label: cli.label,
         kharka: None,
