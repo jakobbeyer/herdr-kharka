@@ -13,8 +13,9 @@ change. With it running on every machine, any tool reads the agents of all machi
   it is current.
 - **Context of Claude sessions:** every Claude agent gets `context_tokens`, the input plus cache tokens of its last
   answer, from its transcript (`~/.claude*/projects/*/<session>.jsonl`), and every agent the git branch of its folder.
-- **Commands from other machines:** it runs the `agent.*` methods other machines write for this one into
-  `herdr.commands/<node>/` against the local herdr and answers them there (see [Commands](#commands)).
+- **Commands from other machines:** with `--commands` it runs the `agent.*` methods other machines write for this one
+  into `herdr.commands/<node>/` against the local herdr and answers them there; off by default (see
+  [Commands](#commands)).
 - **Only this machine's agents:** a herdr that lists agents and workspaces of other machines too (e.g. a fork with
   federation) has them left out; each machine writes its own.
 - **Steady:** a single failed look at herdr (a timeout) keeps the last state; herdr is written as `offline` after three
@@ -24,17 +25,34 @@ change. With it running on every machine, any tool reads the agents of all machi
 It talks to herdr's socket and to the local kharka daemon's socket, nothing else: commands reach other machines
 through kharka, without ssh.
 
-## Install and run
+## Install
 
-Needs Rust 1.85 or newer to build, a running `kharka daemon` on the machine and herdr (tested with 0.9.3).
+A prebuilt binary (macOS and Linux, arm64 and x86_64; the Linux builds are static):
 
 ```sh
-cargo install --git https://github.com/jakobbeyer/herdr-kharka
-herdr-kharka                    # writes herdr/<node>, runs commands for this node
-herdr-kharka --once             # look once, write, end
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jakobbeyer/herdr-kharka/releases/latest/download/herdr-kharka-installer.sh | sh
 ```
 
-As a service, with the arguments given after `service`. macOS (launchd, log in `~/Library/Logs/herdr-kharka.log`):
+With Homebrew, or from source (Rust 1.88 or newer):
+
+```sh
+brew install jakobbeyer/tap/herdr-kharka
+cargo install herdr-kharka
+```
+
+**Compatibility:** herdr-kharka needs kharka 0.1.0 or newer (the socket protocol) with a running `kharka daemon` on
+the machine, and herdr (tested with 0.9.3).
+
+## Run
+
+```sh
+herdr-kharka                    # writes herdr/<node>
+herdr-kharka --commands         # also runs the commands other machines send to this node
+herdr-kharka --once             # look once, write, end (takes no commands, refuses --commands)
+```
+
+As a service, with the arguments given after `service` (options before `service` are refused). macOS (launchd, log in
+`~/Library/Logs/herdr-kharka.log`):
 
 ```sh
 herdr-kharka service > ~/Library/LaunchAgents/dev.kharka.herdr.plist
@@ -48,9 +66,14 @@ herdr-kharka service > ~/.config/systemd/user/herdr-kharka.service
 systemctl --user daemon-reload && systemctl --user enable --now herdr-kharka
 ```
 
+A service that should also take commands from other machines needs `service --commands`; read [Commands](#commands)
+and [SECURITY.md](SECURITY.md) first.
+
 Options: `--herdr-socket` (default `$HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`), `--kharka-socket`
 (`$KHARKA_SOCKET`, else kharka's default), `--key` (default `herdr/{node}`), `--label` (default the node name),
-`--interval`, `--heartbeat`, `--ignore-token` (repeatable, default `spin`), `--no-commands` (run no commands).
+`--interval`, `--heartbeat`, `--ignore-token` (repeatable, default `spin`), `--commands` (run the commands other machines
+send, off by default; not with `--once`). `--no-commands` is still taken and does nothing, so that older service files
+keep working; it cannot be given together with `--commands`.
 
 ## What it writes
 
@@ -101,6 +124,10 @@ new ones are added, none are taken away.
 
 ## Commands
 
+Commands are off by default; `herdr-kharka --commands` turns them on for a machine. Then anyone whose machine syncs
+with the kharka hub can drive the agents on this machine, and an agent can run shell commands: turn them on only where
+you trust every machine on the hub.
+
 A program on any machine (e.g. herdr-deck) has a machine's herdr do something by writing a record for that node,
 `herdr.commands/<node>/<id>`:
 
@@ -118,13 +145,17 @@ command:
 
 The sender reads the answer from its watch and deletes the record. herdr-kharka writes the answer only if the record is
 unchanged since it read it (a sender that gave up and deleted it gets nothing back), and deletes answers nobody took after
-about a minute.
+about a minute. A command runs at most once, also when it comes again before its answer shows. An answer the daemon
+refuses, e.g. a result larger than a kharka value may be, is replaced by a short error; a command whose short error is
+refused too is deleted unanswered after about a minute. A machine without `--commands` does not read or answer its
+commands; a sender that gets no answer should delete its record.
 
 - **Every `agent.*` method** runs (focus, rename, send keys, prompt …), any other one is answered `not allowed`.
 - **Who can send:** every machine whose kharka daemon syncs with the hub, i.e. whoever may reach the hub over ssh;
-  kharka has no permissions per node for records. `--no-commands` turns commands off on a machine.
-- **`expires`** (ms): a command that comes later, e.g. to a machine that was offline, is answered `expired` and does
-  not run. The clocks of the machines should agree to within a few seconds.
+  kharka has no permissions per node for records. Only machines started with `--commands` take commands.
+- **`expires`** (ms) is needed: a command without it is answered `no expires`, one where it is not a number of ms (text,
+  below zero) `expires is not a time in ms`, one that comes later, e.g. to a machine that was offline, `expired`; none
+  of them runs. A fraction of a ms is cut off. The clocks of the machines should agree to within a few seconds.
 - **One after another:** commands run in the order they come, each herdr call taking at most 3 s; a sender should wait
   longer than that for its answer.
 - **The id** is one key segment (`A-Z a-z 0-9 . _ -`) that no other command for that node uses; with the sender's node
@@ -164,6 +195,11 @@ kharka ls herdr/                                         # one key per machine
 kharka get herdr/server | jq '.agents[] | {name, status, context_tokens}'
 kharka watch herdr/ --initial                            # every change, from every machine
 ```
+
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems privately, as
+[SECURITY.md](SECURITY.md) describes.
 
 ## License
 

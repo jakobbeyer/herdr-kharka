@@ -1,0 +1,49 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: herdr-kharka version
+      description: Output of `herdr-kharka --version`.
+    validations:
+      required: true
+  - type: input
+    id: kharka
+    attributes:
+      label: kharka version
+      description: Output of `kharka --version`.
+    validations:
+      required: true
+  - type: input
+    id: herdr
+    attributes:
+      label: herdr version
+      description: Output of `herdr --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15, Debian 12, ...
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Of herdr-kharka (launchd log or `journalctl --user -u herdr-kharka`), around the problem. Remove anything private.
+      render: text

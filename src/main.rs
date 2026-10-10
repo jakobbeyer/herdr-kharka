@@ -2,7 +2,8 @@
 //!
 //! It looks at herdr when herdr reports an event, and every `--interval` anyway, and writes `herdr/<node>` to the local
 //! kharka daemon when the state changed, or every `--heartbeat` so readers can tell it is current. kharka carries it to
-//! every other machine. It also runs the `agent.*` commands other machines write for this one (see [`commands`]).
+//! every other machine. With `--commands` it also runs the `agent.*` commands other machines write for this one (see
+//! [`commands`]).
 
 mod commands;
 mod context;
@@ -30,7 +31,7 @@ const OFFLINE_AFTER: Duration = Duration::from_secs(10);
 
 /// Writes what this machine's herdr runs into kharka (`herdr/<node>`), on every change.
 #[derive(Parser)]
-#[command(version, about, max_term_width = 110)]
+#[command(version, about, max_term_width = 110, args_conflicts_with_subcommands = true)]
 struct Cli {
     /// herdr's socket [default: $HERDR_SOCKET_PATH, else ~/.config/herdr/herdr.sock]
     #[arg(long)]
@@ -56,8 +57,13 @@ struct Cli {
     /// Look once, write, and end
     #[arg(long)]
     once: bool,
-    /// Do not run the agent.* commands that other machines write to herdr.commands/<node>/
-    #[arg(long)]
+    /// Run the agent.* commands that other machines write to herdr.commands/<node>/; any machine that syncs with the
+    /// kharka hub can send them
+    #[arg(long, conflicts_with = "once")]
+    commands: bool,
+    // Commands used to be on unless this was given; it is kept, doing nothing, so that older service files still start.
+    // Given with --commands, the two contradict each other: refused rather than guessed.
+    #[arg(long, hide = true, conflicts_with = "commands")]
     no_commands: bool,
     #[command(subcommand)]
     command: Option<Command>,
@@ -106,8 +112,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let herdr_socket = cli.herdr_socket.unwrap_or_else(herdr::default_socket);
     let kharka_socket = cli.kharka_socket.unwrap_or_else(kharka::default_socket);
-    if !cli.once && !cli.no_commands {
-        commands::spawn(kharka_socket.clone(), herdr_socket.clone());
+    if !cli.once {
+        if cli.commands {
+            eprintln!("herdr-kharka: running the agent.* commands other machines write to herdr.commands/<node>/");
+            commands::spawn(kharka_socket.clone(), herdr_socket.clone());
+        } else {
+            eprintln!("herdr-kharka: commands are off (--commands runs them)");
+        }
     }
     let mut herdr = Watcher::new(herdr_socket, cli.ignore_tokens);
     let mut collector = Collector {

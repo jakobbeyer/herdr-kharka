@@ -1,11 +1,27 @@
 [package]
 name = "herdr-kharka"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 description = "Writes what a machine's herdr runs into kharka, on every change"
 license = "MIT"
 repository = "https://github.com/jakobbeyer/herdr-kharka"
+homepage = "https://github.com/jakobbeyer/herdr-kharka"
+readme = "README.md"
+rust-version = "1.88"
+include = [
+    "/src/**",
+    "/tests/**",
+    "/contrib/**",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/CONTRIBUTING.md",
+    "/Cargo.toml",
+    "/Cargo.lock",
+]
 keywords = ["herdr", "kharka", "agents", "claude"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -15,3 +31,8 @@ serde_json = "1.0.151"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

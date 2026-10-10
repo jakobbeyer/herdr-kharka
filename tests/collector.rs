@@ -232,6 +232,13 @@ impl FakeKharka {
         panic!("nobody watches {prefix}");
     }
 
+    /// Sends `ready` (every current entry has come) or `reset` (the watch fell behind) to every watch.
+    fn event(&self, event: &str) {
+        for (_, id, stream) in self.watches.lock().unwrap().iter_mut() {
+            let _ = writeln!(stream, "{}", json!({ "id": id, "event": event }));
+        }
+    }
+
     /// Sends an entry to every watch whose prefix it starts with.
     fn change(&self, entry: Value) {
         let key = entry["key"].as_str().unwrap().to_string();
@@ -686,7 +693,7 @@ fn a_refused_write_keeps_the_connection_and_waits() {
     let mut running = collector(
         &herdr.socket,
         &kharka.socket,
-        &["--interval", "100ms", "--heartbeat", "1s", "--no-commands"],
+        &["--interval", "100ms", "--heartbeat", "1s"],
     )
     .stderr(Stdio::piped())
     .spawn()
@@ -724,7 +731,7 @@ fn a_hanging_kharka_daemon_does_not_hold_up_the_collector() {
     assert!(started.elapsed() < Duration::from_secs(15), "gave up after the timeout");
 }
 
-/// A command for this machine, as another machine writes it.
+/// A command for this machine, as another machine writes it; it expires `expires_in_ms` from now.
 fn command(id: &str, method: &str, params: Value, expires_in_ms: i64) -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -756,7 +763,11 @@ fn a_command_runs_against_herdr_and_is_answered() {
     let dir = tempfile::tempdir().unwrap();
     let herdr = FakeHerdr::start(dir.path(), json!([agent("w1:p1", "working")]));
     let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
-    let _running = Killed(collector(&herdr.socket, &kharka.socket, &[]).spawn().unwrap());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka.socket, &["--commands"])
+            .spawn()
+            .unwrap(),
+    );
     kharka.wait_watched("herdr.commands/mac/");
     let sent = command(
         "server-1",
@@ -793,7 +804,11 @@ fn herdrs_error_is_the_answer() {
     let dir = tempfile::tempdir().unwrap();
     let herdr = FakeHerdr::start(dir.path(), json!([]));
     let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
-    let _running = Killed(collector(&herdr.socket, &kharka.socket, &[]).spawn().unwrap());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka.socket, &["--commands"])
+            .spawn()
+            .unwrap(),
+    );
     kharka.wait_watched("herdr.commands/mac/");
     kharka.change(command(
         "server-2",
@@ -812,7 +827,11 @@ fn only_agent_methods_run_and_only_before_they_expire() {
     let dir = tempfile::tempdir().unwrap();
     let herdr = FakeHerdr::start(dir.path(), json!([]));
     let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
-    let _running = Killed(collector(&herdr.socket, &kharka.socket, &[]).spawn().unwrap());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka.socket, &["--commands"])
+            .spawn()
+            .unwrap(),
+    );
     kharka.wait_watched("herdr.commands/mac/");
     kharka.change(command(
         "server-3",
@@ -821,28 +840,247 @@ fn only_agent_methods_run_and_only_before_they_expire() {
         15000,
     ));
     kharka.change(command("server-4", "agent.focus", json!({ "target": "w1:p1" }), -1000));
+    let mut forever = command("server-5", "agent.focus", json!({ "target": "w1:p1" }), 0);
+    forever["value"].as_object_mut().unwrap().remove("expires");
+    kharka.change(forever);
     let answers = answers_within(&kharka.puts, Duration::from_secs(2));
     let errors: Vec<&Value> = answers.iter().map(|(_, answer)| &answer["done"]["error"]).collect();
     assert_eq!(
         errors,
         [
             &json!("pane.send_text: not allowed, only agent.* methods"),
-            &json!("expired before it came")
+            &json!("expired before it came"),
+            &json!("no expires")
         ]
     );
     assert!(herdr.calls().is_empty(), "nothing ran: {:?}", herdr.calls());
 }
 
 #[test]
-fn without_commands_nothing_watches_them() {
+fn a_command_that_comes_again_is_answered_again_not_run_again() {
     let dir = tempfile::tempdir().unwrap();
     let herdr = FakeHerdr::start(dir.path(), json!([]));
     let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
     let _running = Killed(
-        collector(&herdr.socket, &kharka.socket, &["--no-commands"])
+        collector(&herdr.socket, &kharka.socket, &["--commands"])
             .spawn()
             .unwrap(),
     );
-    puts_within(&kharka.puts, Duration::from_millis(500));
-    assert!(kharka.watches.lock().unwrap().is_empty());
+    kharka.wait_watched("herdr.commands/mac/");
+    let sent = command(
+        "server-6",
+        "agent.prompt",
+        json!({ "target": "w1:p1", "text": "go on" }),
+        15000,
+    );
+    kharka.change(sent.clone());
+    let first = answers_within(&kharka.puts, Duration::from_secs(1));
+    // as when the watch fell behind and brings every current entry again, before the answer showed
+    kharka.change(sent);
+    let again = answers_within(&kharka.puts, Duration::from_secs(1));
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_eq!(again[0].1["done"], first[0].1["done"], "the same answer");
+    assert_eq!(herdr.calls().len(), 1, "ran once: {:?}", herdr.calls());
+}
+
+#[test]
+fn a_refused_answer_does_not_run_the_command_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::RefusePuts);
+    let mut running = collector(&herdr.socket, &kharka.socket, &["--commands"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    kharka.wait_watched("herdr.commands/mac/");
+    let sent = command("server-7", "agent.send_keys", json!({ "target": "w1:p1" }), 15000);
+    kharka.change(sent.clone());
+    let answers = answers_within(&kharka.puts, Duration::from_secs(1));
+    // as when the watch was opened again
+    kharka.change(sent);
+    let again = answers_within(&kharka.puts, Duration::from_millis(500));
+    running.kill().unwrap();
+    let output = running.wait_with_output().unwrap();
+    // the answer, then a short one instead
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert_eq!(answers[0].1["done"]["ok"], true);
+    assert_eq!(
+        answers[1].1["done"]["error"],
+        "agent.send_keys: its answer was refused: does not fit the schema"
+    );
+    assert_eq!(kharka.watches.lock().unwrap().len(), 1, "the watch stays");
+    assert_eq!(herdr.calls().len(), 1);
+    assert!(again.is_empty(), "given up on, not tried again: {again:?}");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(log.contains("no answer could be written"), "{log}");
+    assert!(!log.contains("from \"server\"\n"), "not logged as answered: {log}");
+}
+
+#[test]
+fn a_command_deleted_while_nobody_watched_is_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let _running = Killed(
+        collector(&herdr.socket, &kharka.socket, &["--commands"])
+            .spawn()
+            .unwrap(),
+    );
+    kharka.wait_watched("herdr.commands/mac/");
+    kharka.event("ready");
+    let sent = command("server-9", "agent.focus", json!({ "target": "w1:p1" }), 15000);
+    kharka.change(sent.clone());
+    assert_eq!(answers_within(&kharka.puts, Duration::from_millis(500)).len(), 1);
+
+    // the watch fell behind, the command is still there: answered again, not run again
+    kharka.event("reset");
+    kharka.change(sent.clone());
+    kharka.event("ready");
+    assert_eq!(answers_within(&kharka.puts, Duration::from_millis(500)).len(), 1);
+    assert_eq!(herdr.calls().len(), 1);
+
+    // it fell behind again and the command was deleted meanwhile: forgotten. A deleted command cannot come back with
+    // its stamp; it is sent again only to show that it was forgotten.
+    kharka.event("reset");
+    kharka.event("ready");
+    thread::sleep(Duration::from_millis(200));
+    kharka.change(sent);
+    assert_eq!(answers_within(&kharka.puts, Duration::from_millis(500)).len(), 1);
+    assert_eq!(herdr.calls().len(), 2, "{:?}", herdr.calls());
+}
+
+#[test]
+fn expires_is_a_number_of_ms() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let _running = Killed(
+        collector(&herdr.socket, &kharka.socket, &["--commands"])
+            .spawn()
+            .unwrap(),
+    );
+    kharka.wait_watched("herdr.commands/mac/");
+    let mut fraction = command("server-10", "agent.focus", json!({ "target": "w1:p1" }), 15000);
+    fraction["value"]["expires"] = json!(fraction["value"]["expires"].as_f64().unwrap() + 0.5);
+    kharka.change(fraction);
+    let mut negative = command("server-11", "agent.focus", json!({ "target": "w1:p1" }), 15000);
+    negative["value"]["expires"] = json!(-1);
+    kharka.change(negative);
+    let mut text = command("server-12", "agent.focus", json!({ "target": "w1:p1" }), 15000);
+    text["value"]["expires"] = json!("soon");
+    kharka.change(text);
+    let answers = answers_within(&kharka.puts, Duration::from_secs(2));
+    let done: Vec<&Value> = answers.iter().map(|(_, answer)| &answer["done"]).collect();
+    assert_eq!(done.len(), 3, "{done:?}");
+    assert_eq!(done[0]["ok"], true, "a fraction is cut off: {done:?}");
+    assert_eq!(done[1]["error"], "expires is not a time in ms");
+    assert_eq!(done[2]["error"], "expires is not a time in ms");
+    assert_eq!(herdr.calls().len(), 1);
+}
+
+#[test]
+fn what_a_sender_writes_cannot_forge_a_line_in_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let mut running = collector(&herdr.socket, &kharka.socket, &["--commands"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    kharka.wait_watched("herdr.commands/mac/");
+    kharka.change(command("server-13", "x\nherdr-kharka: forged", json!({}), 15000));
+    assert_eq!(answers_within(&kharka.puts, Duration::from_secs(1)).len(), 1);
+    running.kill().unwrap();
+    let output = running.wait_with_output().unwrap();
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(log.contains("failed"), "{log}");
+    assert!(
+        !log.lines().any(|line| line.starts_with("herdr-kharka: forged")),
+        "{log}"
+    );
+}
+
+#[test]
+fn without_commands_a_command_is_neither_run_nor_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let kharka = fake_kharka_with(dir.path(), Daemon::Answer);
+    let mut running = collector(&herdr.socket, &kharka.socket, &[])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(
+        !puts_within(&kharka.puts, Duration::from_millis(500)).is_empty(),
+        "it runs"
+    );
+    kharka.change(command("server-8", "agent.focus", json!({ "target": "w1:p1" }), 15000));
+    let answers = answers_within(&kharka.puts, Duration::from_secs(1));
+    running.kill().unwrap();
+    let output = running.wait_with_output().unwrap();
+    assert!(answers.is_empty(), "{answers:?}");
+    assert!(herdr.calls().is_empty(), "{:?}", herdr.calls());
+    assert!(
+        kharka.watches.lock().unwrap().is_empty(),
+        "nothing watches herdr.commands/"
+    );
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(log.contains("commands are off"), "{log}");
+}
+
+#[test]
+fn the_service_runs_with_the_arguments_after_service() {
+    let output = Command::new(BIN)
+        .args(["service", "--commands", "--label", "a b"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let file = String::from_utf8(output.stdout).unwrap();
+    if cfg!(target_os = "macos") {
+        let arguments = "</string>\n        <string>--commands</string>\n        <string>--label</string>\n        <string>a b</string>\n    </array>";
+        assert!(file.contains(&format!("{BIN}{arguments}")), "{file}");
+    } else {
+        assert!(
+            file.contains(&format!("ExecStart={BIN} --commands --label \"a b\"\n")),
+            "{file}"
+        );
+    }
+
+    // an option before `service` would be left out of the service: refused
+    let output = Command::new(BIN).args(["--commands", "service"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn no_commands_is_still_taken_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    let status = collector(&herdr.socket, &kharka, &["--once", "--no-commands"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "an older service file still starts");
+    puts.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // contradicting itself: refused, before anything is written
+    let status = collector(&herdr.socket, &kharka, &["--no-commands", "--commands"])
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(puts.recv_timeout(Duration::from_millis(300)).is_err());
+}
+
+#[test]
+fn once_does_not_take_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    let output = collector(&herdr.socket, &kharka, &["--once", "--commands"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "refused, not ignored");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+    assert!(puts.recv_timeout(Duration::from_millis(300)).is_err());
 }
