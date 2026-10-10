@@ -26,10 +26,16 @@ I consider the report a vulnerability, and I will credit you in the fix if you w
   size of a session. It writes only token counts, never the content of a transcript.
 - **What it writes is readable by every machine on the hub.** `herdr/<node>` holds agent names, terminal titles,
   folders, git branches and pane tokens. Do not sync it to machines that should not see these.
-- **Commands are off by default.** With `--commands`, every machine that syncs with the kharka hub can run every
-  `agent.*` herdr method on this machine, including sending prompts and keys to agents, and an agent can run shell
-  commands. `agent.*` is a prefix: a method a later herdr adds under it is allowed as well. kharka has no permissions
-  per node for records, and the sender a command names (`from`) is not checked. Turn commands on only where every
-  machine on the hub is trusted. `--no-commands` from older service files is taken and does nothing.
+- **Commands are off by default.** With `--commands`, every machine that syncs with the kharka hub can run the allowed
+  herdr methods on this machine. That includes sending keys to agents, and an agent can run shell commands. kharka has
+  no permissions per node for records, and the sender a command names (`from`) is not checked. Turn commands on only
+  where every machine on the hub is trusted. `--no-commands` from older service files is taken and does nothing.
+- **Only listed methods run.** The allowlist is fixed by name; the README's Commands section lists it, and
+  `herdr/<node>` shows it as `commands`. It includes sending keys and reading a pane's output (`agent.read`). A method a
+  later herdr adds is not allowed until it is named with `--allow-method`, which takes only `agent.*` names.
+- **Commands are limited.** Within a minute at most 60 commands run, at most 30 per sender, and herdr spends at most
+  about 20 s on them; any more are answered without running. The sender (`from`) is not checked, so a hostile machine
+  can name other senders and get past the limit per sender, and still holds up all senders until the minute is over.
+  The limits for all senders together hold in any case: herdr spends at most about a third of each minute on commands.
 - **The log quotes what a sender wrote.** A command's method, sender and error are logged quoted and escaped, so that a
   command cannot add lines of its own to the log.

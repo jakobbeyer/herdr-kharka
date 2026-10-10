@@ -4,6 +4,27 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 the project follows [Semantic Versioning](https://semver.org/). Before 1.0, a minor release may still change what is
 written or how commands work; the notes say so when it does.
 
+## [0.2.0] - 2026-10-10
+
+### Changed
+
+- Commands run only the methods of an allowlist instead of every `agent.*` method (see Commands in the README, or
+  `herdr-kharka --help`). `agent.prompt`, `agent.start`, `agent.wait` and `agent.view.*` are no longer run by default,
+  nor is a method a later herdr adds. A method outside the list is refused with `<method>: not allowed` (0.1.0 added
+  `, only agent.* methods`). Senders that use such a method need `--allow-method <method>` on the receiving machine,
+  in its service too.
+- `herdr-kharka service` refuses arguments that would not keep it running (wrong ones, `--help`, `--version`,
+  `--once`, a subcommand), instead of writing them into the service.
+
+### Added
+
+- `--allow-method <method>` (repeatable, with `--commands`) allows one more `agent.*` method.
+- Limits on commands: within a minute at most 60 run, at most 30 per sender (`from`), and at most 20 s of herdr's time.
+  One beyond is answered `too many commands, try again later` without running. Only commands that reached herdr count.
+- `commands` in `herdr/<node>`: the methods the machine takes from other machines while it takes them, else empty;
+  left out by `--once`. Readers can skip machines that do not take a command. `contrib/herdr.schema.json` knows the
+  field; a hub with the older schema takes it too.
+
 ## [0.1.0] - 2026-10-10
 
 The first release.
@@ -40,4 +61,5 @@ For those who ran a build from before this release:
 - `--no-commands` is still taken and does nothing, so that older service files keep starting. It cannot be given
   together with `--commands`.
 
+[0.2.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.1.0

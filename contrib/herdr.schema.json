@@ -9,6 +9,7 @@
     "origin_machine_id": { "type": ["string", "null"] },
     "focused": { "type": ["string", "null"] },
     "focus_changed": { "type": ["integer", "null"], "minimum": 0 },
+    "commands": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "workspaces": {
       "type": "array",
       "items": {

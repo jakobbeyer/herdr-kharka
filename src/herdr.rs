@@ -201,9 +201,20 @@ fn request(socket: &Path, method: &str) -> anyhow::Result<Value> {
     call(socket, method, &json!({}))
 }
 
-/// Any method with its params, on its own connection: the result, or herdr's error message.
+/// A call that did not reach herdr: its socket is gone or nobody listens there (herdr restarts).
+#[derive(Debug)]
+pub struct NoHerdr(PathBuf);
+
+impl std::fmt::Display for NoHerdr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no herdr at {}", self.0.display())
+    }
+}
+
+/// Any method with its params, on its own connection: the result, or herdr's error message; [`NoHerdr`] when it could
+/// not connect.
 pub fn call(socket: &Path, method: &str, params: &Value) -> anyhow::Result<Value> {
-    let mut stream = UnixStream::connect(socket).with_context(|| format!("no herdr at {}", socket.display()))?;
+    let mut stream = UnixStream::connect(socket).with_context(|| NoHerdr(socket.to_path_buf()))?;
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     writeln!(

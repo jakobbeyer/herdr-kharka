@@ -13,8 +13,8 @@ change. With it running on every machine, any tool reads the agents of all machi
   it is current.
 - **Context of Claude sessions:** every Claude agent gets `context_tokens`, the input plus cache tokens of its last
   answer, from its transcript (`~/.claude*/projects/*/<session>.jsonl`), and every agent the git branch of its folder.
-- **Commands from other machines:** with `--commands` it runs the `agent.*` methods other machines write for this one
-  into `herdr.commands/<node>/` against the local herdr and answers them there; off by default (see
+- **Commands from other machines:** with `--commands` it runs the allowed `agent.*` methods other machines write for
+  this one into `herdr.commands/<node>/` against the local herdr and answers them there; off by default (see
   [Commands](#commands)).
 - **Only this machine's agents:** a herdr that lists agents and workspaces of other machines too (e.g. a fork with
   federation) has them left out; each machine writes its own.
@@ -48,10 +48,12 @@ the machine, and herdr (tested with 0.9.3).
 ```sh
 herdr-kharka                    # writes herdr/<node>
 herdr-kharka --commands         # also runs the commands other machines send to this node
+herdr-kharka --commands --allow-method agent.prompt   # and allows one more agent.* method
 herdr-kharka --once             # look once, write, end (takes no commands, refuses --commands)
 ```
 
-As a service, with the arguments given after `service` (options before `service` are refused). macOS (launchd, log in
+As a service, with the arguments given after `service` (options before `service` are refused, and so are arguments
+that would not start). macOS (launchd, log in
 `~/Library/Logs/herdr-kharka.log`):
 
 ```sh
@@ -66,13 +68,14 @@ herdr-kharka service > ~/.config/systemd/user/herdr-kharka.service
 systemctl --user daemon-reload && systemctl --user enable --now herdr-kharka
 ```
 
-A service that should also take commands from other machines needs `service --commands`; read [Commands](#commands)
-and [SECURITY.md](SECURITY.md) first.
+A service that should also take commands from other machines needs `service --commands` (and any `--allow-method`);
+read [Commands](#commands) and [SECURITY.md](SECURITY.md) first.
 
 Options: `--herdr-socket` (default `$HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`), `--kharka-socket`
 (`$KHARKA_SOCKET`, else kharka's default), `--key` (default `herdr/{node}`), `--label` (default the node name),
 `--interval`, `--heartbeat`, `--ignore-token` (repeatable, default `spin`), `--commands` (run the commands other machines
-send, off by default; not with `--once`). `--no-commands` is still taken and does nothing, so that older service files
+send, off by default; not with `--once`), `--allow-method` (repeatable, only with `--commands`: allow one more `agent.*`
+method). `--no-commands` is still taken and does nothing, so that older service files
 keep working; it cannot be given together with `--commands`.
 
 ## What it writes
@@ -88,6 +91,7 @@ herdr's API objects, so that readers do not break when herdr changes:
   "origin_machine_id": "machine_5d1f4e8b",
   "focused": "w0:p1",
   "focus_changed": 1791556101230,
+  "commands": [],
   "workspaces": [ { "id": "w0", "number": 2, "label": "api", "tokens": { "tests": "◌ 3/40" } } ],
   "agents": [
     {
@@ -110,6 +114,7 @@ herdr's API objects, so that readers do not break when herdr changes:
 | `origin_machine_id` | herdr's id of this installation, if herdr reports one |
 | `focused` | the pane the herdr TUI shows, if it is an agent |
 | `focus_changed` | when herdr-kharka last saw `focused` change (ms), else null: which machine is in use right now |
+| `commands` | the methods this machine takes from other machines, see [Commands](#commands); else empty |
 | `workspaces` | in the TUI's order (`number`), with the label herdr shows and the workspace's tokens |
 | `terminal_id` | herdr's id of the agent's terminal, which stays when its pane moves |
 | `display_agent` | the short name herdr shows for the agent, e.g. `C2` |
@@ -150,7 +155,20 @@ refuses, e.g. a result larger than a kharka value may be, is replaced by a short
 refused too is deleted unanswered after about a minute. A machine without `--commands` does not read or answer its
 commands; a sender that gets no answer should delete its record.
 
-- **Every `agent.*` method** runs (focus, rename, send keys, prompt …), any other one is answered `not allowed`.
+- **Only allowed methods run.** By default these are the ones herdr-deck sends (`agent.list`, `agent.focus`,
+  `agent.rename`, `agent.send_keys`) and herdr's agent methods that only read (`agent.get`, `agent.read`,
+  `agent.explain`). `agent.wait` is not among them: it waits longer than the 3 s a call may take. `--allow-method` adds
+  one more, e.g. `--allow-method agent.prompt`; it takes only `agent.*` names. Any other method, also one a later herdr
+  adds, is answered `<method>: not allowed`.
+- **The machine says what it takes:** `commands` in `herdr/<node>` lists the allowed methods while the machine takes
+  commands (its watch on `herdr.commands/<node>/` is up). It is empty when commands are off or not taken right now, and
+  missing before 0.2.0 and from `--once`. A sender can skip machines that do not take the method it wants to send.
+- **Limits:** within the last minute, at most 60 commands, at most 30 from one sender (`from`), and at most 20 s that
+  herdr spent on them. A command beyond a limit is answered `too many commands, try again later` without running; sent
+  again later (a new record, or the same one written again), it is looked at again. Only commands that reached herdr
+  count: not those answered without running, nor those that found no herdr (it restarts). `from` is not checked: the
+  limit per sender holds back a sender that runs wild (e.g. a retry loop), not one that names another sender. The
+  limits for all senders together hold either way.
 - **Who can send:** every machine whose kharka daemon syncs with the hub, i.e. whoever may reach the hub over ssh;
   kharka has no permissions per node for records. Only machines started with `--commands` take commands.
 - **`expires`** (ms) is needed: a command without it is answered `no expires`, one where it is not a number of ms (text,

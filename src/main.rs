@@ -2,8 +2,8 @@
 //!
 //! It looks at herdr when herdr reports an event, and every `--interval` anyway, and writes `herdr/<node>` to the local
 //! kharka daemon when the state changed, or every `--heartbeat` so readers can tell it is current. kharka carries it to
-//! every other machine. With `--commands` it also runs the `agent.*` commands other machines write for this one (see
-//! [`commands`]).
+//! every other machine. With `--commands` it also runs the allowed `agent.*` commands other machines write for this one
+//! (see [`commands`]).
 
 mod commands;
 mod context;
@@ -57,10 +57,12 @@ struct Cli {
     /// Look once, write, and end
     #[arg(long)]
     once: bool,
-    /// Run the agent.* commands that other machines write to herdr.commands/<node>/; any machine that syncs with the
-    /// kharka hub can send them
-    #[arg(long, conflicts_with = "once")]
+    // the help names the methods allowed by default, from the list itself
+    #[arg(long, conflicts_with = "once", help = commands_help())]
     commands: bool,
+    /// Also allow this agent.* method for commands, e.g. agent.prompt (repeatable)
+    #[arg(long = "allow-method", value_name = "METHOD", requires = "commands", value_parser = commands::method_name)]
+    allow_methods: Vec<String>,
     // Commands used to be on unless this was given; it is kept, doing nothing, so that older service files still start.
     // Given with --commands, the two contradict each other: refused rather than guessed.
     #[arg(long, hide = true, conflicts_with = "commands")]
@@ -76,6 +78,14 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+fn commands_help() -> String {
+    format!(
+        "Run the commands that other machines write to herdr.commands/<node>/; any machine that syncs with the kharka \
+         hub can send them. Allowed: {}",
+        commands::DEFAULT_METHODS.join(", ")
+    )
 }
 
 /// `500ms`, `3s`, `5m`, `1h`.
@@ -105,6 +115,7 @@ fn main() {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(Command::Service { args }) = cli.command {
+        check_service(&args)?;
         let exe = std::env::current_exe().context("finding the herdr-kharka binary")?;
         print!("{}", service::file(&exe, &args));
         eprintln!("Install it:\n{}", service::instructions());
@@ -112,10 +123,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let herdr_socket = cli.herdr_socket.unwrap_or_else(herdr::default_socket);
     let kharka_socket = cli.kharka_socket.unwrap_or_else(kharka::default_socket);
+    let (wake, woken) = mpsc::channel::<()>();
+    let allowed = commands::allowed(&cli.allow_methods);
+    // set while the commands are taken (their watch is up)
+    let mut up = None;
     if !cli.once {
         if cli.commands {
-            eprintln!("herdr-kharka: running the agent.* commands other machines write to herdr.commands/<node>/");
-            commands::spawn(kharka_socket.clone(), herdr_socket.clone());
+            eprintln!(
+                "herdr-kharka: running the commands other machines write to herdr.commands/<node>/: {}",
+                allowed.join(", ")
+            );
+            let taking = commands::Up::new(wake.clone());
+            commands::spawn(
+                kharka_socket.clone(),
+                herdr_socket.clone(),
+                allowed.clone(),
+                taking.clone(),
+            );
+            up = Some(taking);
         } else {
             eprintln!("herdr-kharka: commands are off (--commands runs them)");
         }
@@ -131,14 +156,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         refused: None,
         problems: Problems::default(),
     };
+    // without `commands`: the record of a herdr-kharka that runs as a service says whether it takes them, not this one
     if cli.once {
         let state = herdr.look(&mut Problems::default());
         return collector.write(&state);
     }
-    let (wake, woken) = mpsc::channel::<()>();
     let mut events = Events::default();
     loop {
-        let state = herdr.look(&mut collector.problems);
+        let mut state = herdr.look(&mut collector.problems);
+        // a change of it is a change of the state: written at once
+        state["commands"] = match &up {
+            Some(up) if up.get() => json!(allowed),
+            _ => json!([]),
+        };
         events.follow(&herdr.socket, &herdr.panes, &wake);
         match events.problem() {
             Some(problem) => collector
@@ -157,6 +187,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             while woken.try_recv().is_ok() {}
         }
     }
+}
+
+/// Refuses service arguments that would not keep herdr-kharka running, so that they are not written into a service that
+/// fails or ends again and again.
+fn check_service(args: &[String]) -> anyhow::Result<()> {
+    let cli = match Cli::try_parse_from(std::iter::once("herdr-kharka").chain(args.iter().map(String::as_str))) {
+        Ok(cli) => cli,
+        Err(err) if err.use_stderr() => err.exit(),
+        // --help, --version
+        Err(_) => bail!("service: --help and --version end at once; a service needs arguments that keep it running"),
+    };
+    if cli.once || cli.command.is_some() {
+        bail!("service: --once and subcommands end at once; a service needs arguments that keep it running");
+    }
+    Ok(())
 }
 
 /// herdr as the collector sees it, look by look.
