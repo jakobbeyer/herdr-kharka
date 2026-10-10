@@ -15,8 +15,8 @@ change. With it running on every machine, any tool reads the agents of all machi
   answer, from its transcript (`~/.claude*/projects/*/<session>.jsonl`), and every agent the git branch of its folder.
 - **Commands from other machines:** it runs the `agent.*` methods other machines write for this one into
   `herdr.commands/<node>/` against the local herdr and answers them there (see [Commands](#commands)).
-- **Only this machine's agents:** agents and workspaces herdr federates from other machines are left to their own
-  machine.
+- **Only this machine's agents:** a herdr that lists agents and workspaces of other machines too (e.g. a fork with
+  federation) has them left out; each machine writes its own.
 - **Steady:** a single failed look at herdr (a timeout) keeps the last state; herdr is written as `offline` after three
   failed looks in a row or 10 s, at once only when its socket is gone. A write the kharka daemon refuses keeps the
   connection, is logged once and tried again after the heartbeat; a daemon that hangs is given up on after 5 s.
@@ -26,17 +26,26 @@ through kharka, without ssh.
 
 ## Install and run
 
+Needs Rust 1.85 or newer to build, a running `kharka daemon` on the machine and herdr (tested with 0.9.3).
+
 ```sh
 cargo install --git https://github.com/jakobbeyer/herdr-kharka
-herdr-kharka                    # needs a running `kharka daemon`; writes herdr/<node>
+herdr-kharka                    # writes herdr/<node>, runs commands for this node
 herdr-kharka --once             # look once, write, end
 ```
 
-As a service (launchd on macOS, systemd on Linux):
+As a service, with the arguments given after `service`. macOS (launchd, log in `~/Library/Logs/herdr-kharka.log`):
 
 ```sh
 herdr-kharka service > ~/Library/LaunchAgents/dev.kharka.herdr.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kharka.herdr.plist
+```
+
+Linux (systemd user unit, log in `journalctl --user -u herdr-kharka`):
+
+```sh
+herdr-kharka service > ~/.config/systemd/user/herdr-kharka.service
+systemctl --user daemon-reload && systemctl --user enable --now herdr-kharka
 ```
 
 Options: `--herdr-socket` (default `$HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`), `--kharka-socket`
@@ -75,7 +84,7 @@ herdr's API objects, so that readers do not break when herdr changes:
 | field | |
 |---|---|
 | `label` | the machine's name for people and readers such as bhote (`--label`, else the node name) |
-| `origin_machine_id` | herdr's id of this machine; federated herdrs show it on this machine's agents |
+| `origin_machine_id` | herdr's id of this installation, if herdr reports one |
 | `focused` | the pane the herdr TUI shows, if it is an agent |
 | `focus_changed` | when herdr-kharka last saw `focused` change (ms), else null: which machine is in use right now |
 | `workspaces` | in the TUI's order (`number`), with the label herdr shows and the workspace's tokens |
@@ -92,15 +101,15 @@ new ones are added, none are taken away.
 
 ## Commands
 
-A program on any machine (e.g. herdr-deck) has a machine's herdr do something by writing a record for that node:
+A program on any machine (e.g. herdr-deck) has a machine's herdr do something by writing a record for that node,
+`herdr.commands/<node>/<id>`:
 
 ```json
-herdr.commands/server/mac-1791556120001-1
 { "from": "mac", "at": 1791556120001, "expires": 1791556135001, "method": "agent.focus", "params": { "target": "w0:p1" } }
 ```
 
-herdr-kharka on `server` runs the method against its herdr and writes the answer into the same record, the command
-kept:
+herdr-kharka on that node runs the method against its herdr and writes the answer into the same record, next to the
+command:
 
 ```json
 { …, "done": { "at": 1791556120240, "ok": true, "result": { … } } }
@@ -109,19 +118,33 @@ kept:
 
 The sender reads the answer from its watch and deletes the record. herdr-kharka writes the answer only if the record is
 unchanged since it read it (a sender that gave up and deleted it gets nothing back), and deletes answers nobody took after
-a minute.
+about a minute.
 
 - **Every `agent.*` method** runs (focus, rename, send keys, prompt …), any other one is answered `not allowed`.
-  Whoever can write to kharka can steer the agents of every machine: `--no-commands` turns it off on a machine.
+- **Who can send:** every machine whose kharka daemon syncs with the hub, i.e. whoever may reach the hub over ssh;
+  kharka has no permissions per node for records. `--no-commands` turns commands off on a machine.
 - **`expires`** (ms): a command that comes later, e.g. to a machine that was offline, is answered `expired` and does
   not run. The clocks of the machines should agree to within a few seconds.
-- An id that stays unique on the sending machine is enough, e.g. `<node>-<ms>-<counter>`.
+- **One after another:** commands run in the order they come, each herdr call taking at most 3 s; a sender should wait
+  longer than that for its answer.
+- **The id** is one key segment (`A-Z a-z 0-9 . _ -`) that no other command for that node uses; with the sender's node
+  in it, unique on the sending machine is enough, e.g. `<node>-<ms>-<counter>`.
+
+By hand, with a watch open in one terminal and the command written in another:
+
+```sh
+kharka watch herdr.commands/server/
+kharka put herdr.commands/server/me-1 "{\"from\": \"me\", \"at\": $(date +%s)000, \"expires\": $(( $(date +%s) + 30 ))000, \"method\": \"agent.list\"}"
+kharka del herdr.commands/server/me-1
+```
 
 ## The hub's collections
 
 [contrib/](contrib/) has the collections for the hub's `kharka.toml` and their schemas: for `herdr`, each machine
 writes only its own key, an entry not refreshed within the TTL reads as stale, and every write must fit
-`herdr.schema.json`; any machine writes `herdr.commands`, fitting `herdr.commands.schema.json`.
+`herdr.schema.json`; any machine writes `herdr.commands`, fitting `herdr.commands.schema.json`. A hub with
+`strict = true` needs them, any other one checks the writes against the schemas with them. Copy the three files into
+the hub's `~/.config/kharka/` (or add the sections to its `kharka.toml`); the hub reloads them while it runs.
 
 ```toml
 [collections.herdr]
