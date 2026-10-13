@@ -122,7 +122,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     let herdr_socket = cli.herdr_socket.unwrap_or_else(herdr::default_socket);
-    let kharka_socket = cli.kharka_socket.unwrap_or_else(kharka::default_socket);
+    let kharka_socket = cli.kharka_socket.map_or(kharka::Socket::Default, kharka::Socket::Given);
     let (wake, woken) = mpsc::channel::<()>();
     let allowed = commands::allowed(&cli.allow_methods);
     // set while the commands are taken (their watch is up)
@@ -295,7 +295,7 @@ fn now_ms() -> u64 {
 }
 
 struct Collector {
-    kharka_socket: PathBuf,
+    kharka_socket: kharka::Socket,
     key_pattern: String,
     label: Option<String>,
     /// The connection, the key and the label, once the daemon said its node name.
@@ -332,7 +332,7 @@ impl Collector {
 
     fn write(&mut self, state: &Value) -> anyhow::Result<()> {
         if self.kharka.is_none() {
-            let mut kharka = Kharka::connect(&self.kharka_socket)?;
+            let mut kharka = Kharka::connect(&self.kharka_socket.path())?;
             let node = kharka.whoami()?;
             let key = self.key_pattern.replace("{node}", &node);
             if key.contains('{') {

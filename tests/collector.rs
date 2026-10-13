@@ -260,7 +260,10 @@ fn fake_kharka(dir: &Path) -> (PathBuf, Receiver<(String, Value)>) {
 }
 
 fn fake_kharka_with(dir: &Path, daemon: Daemon) -> FakeKharka {
-    let socket = dir.join("kharka.sock");
+    fake_kharka_at(dir.join("kharka.sock"), daemon)
+}
+
+fn fake_kharka_at(socket: PathBuf, daemon: Daemon) -> FakeKharka {
     let listener = UnixListener::bind(&socket).unwrap();
     let (puts, received) = mpsc::channel();
     let whoamis = Arc::new(Mutex::new(0));
@@ -1070,6 +1073,43 @@ fn advertised_within(puts: &Receiver<(String, Value)>, within: Duration) -> Vec<
         }
     }
     written
+}
+
+#[test]
+fn a_kharka_daemon_that_starts_later_is_found_at_its_default_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(dir.path()).unwrap());
+    if Path::new(&format!("/run/user/{uid}/kharka/daemon.sock")).exists() {
+        eprintln!("skipped: a real kharka daemon listens at a default socket of this user");
+        return;
+    }
+    let herdr = FakeHerdr::start(dir.path(), json!([]));
+    // no --kharka-socket and no daemon yet: the default falls back to the first candidate, $XDG_RUNTIME_DIR's
+    let _running = Killed(
+        Command::new(BIN)
+            .arg("--herdr-socket")
+            .arg(&herdr.socket)
+            .args(["--commands", "--interval", "100ms"])
+            .env("HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", dir.path().join("runtime"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env_remove("KHARKA_SOCKET")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    thread::sleep(Duration::from_millis(500));
+    // the daemon comes up at a later candidate, as kharka's does on macOS
+    std::fs::create_dir_all(dir.path().join("state/kharka")).unwrap();
+    let kharka = fake_kharka_at(dir.path().join("state/kharka/daemon.sock"), Daemon::Answer);
+    let written = advertised_within(&kharka.puts, Duration::from_secs(5));
+    assert!(
+        !written.is_empty(),
+        "the state is written to the daemon that came later"
+    );
+    kharka.wait_watched("herdr.commands/mac/");
 }
 
 #[test]

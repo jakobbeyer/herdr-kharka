@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde_json::{Value, json};
 
-use crate::kharka::{Kharka, Refused, Seen, Watch};
+use crate::kharka::{Kharka, Refused, Seen, Socket, Watch};
 use crate::{Problems, herdr, now_ms};
 
 pub const PREFIX: &str = "herdr.commands/";
@@ -170,7 +170,7 @@ enum Answer {
 }
 
 /// Follows this node's commands in a thread of its own, for as long as herdr-kharka runs.
-pub fn spawn(kharka_socket: PathBuf, herdr_socket: PathBuf, allowed: Vec<String>, up: Up) {
+pub fn spawn(kharka_socket: Socket, herdr_socket: PathBuf, allowed: Vec<String>, up: Up) {
     thread::spawn(move || {
         let mut problems = Problems::default();
         let mut pause = Duration::from_millis(250);
@@ -201,7 +201,7 @@ pub fn spawn(kharka_socket: PathBuf, herdr_socket: PathBuf, allowed: Vec<String>
 
 /// One connection's worth: watches `herdr.commands/<node>/` until the connection fails.
 fn serve(
-    kharka_socket: &Path,
+    kharka_socket: &Socket,
     herdr_socket: &Path,
     ran: &mut Ran,
     guard: &mut Guard,
@@ -209,8 +209,9 @@ fn serve(
     problems: &mut Problems,
     pause: &mut Duration,
 ) -> anyhow::Result<()> {
-    let mut watch = Watch::open(kharka_socket, &format!("{PREFIX}{{node}}/"))?;
-    let mut writer = Kharka::connect(kharka_socket)?;
+    let kharka_socket = kharka_socket.path();
+    let mut watch = Watch::open(&kharka_socket, &format!("{PREFIX}{{node}}/"))?;
+    let mut writer = Kharka::connect(&kharka_socket)?;
     up.set(true);
     problems.clear("commands");
     *pause = Duration::from_millis(250);

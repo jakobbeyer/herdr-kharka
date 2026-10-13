@@ -63,6 +63,24 @@ pub fn default_socket() -> PathBuf {
     candidates.into_iter().find(|path| path.exists()).unwrap_or(first)
 }
 
+/// The daemon's socket: the one given, or the default, looked for again on every connection. A daemon that starts after
+/// herdr-kharka (both at login) has no socket yet when herdr-kharka starts; fixing the default then would keep the
+/// first candidate, where the daemon may never listen.
+#[derive(Clone, Debug)]
+pub enum Socket {
+    Given(PathBuf),
+    Default,
+}
+
+impl Socket {
+    pub fn path(&self) -> PathBuf {
+        match self {
+            Socket::Given(path) => path.clone(),
+            Socket::Default => default_socket(),
+        }
+    }
+}
+
 pub struct Kharka {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
