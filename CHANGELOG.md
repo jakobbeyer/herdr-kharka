@@ -4,6 +4,14 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 the project follows [Semantic Versioning](https://semver.org/). Before 1.0, a minor release may still change what is
 written or how commands work; the notes say so when it does.
 
+## [0.2.1] - 2026-10-13
+
+### Fixed
+
+- Without `--kharka-socket`, the daemon's socket is looked for again on every connection, not once at the start. A
+  daemon that started after herdr-kharka (both at login) was never found: herdr-kharka kept trying the first default
+  (`/run/user/<uid>/…` on macOS), and `herdr/<node>` went stale.
+
 ## [0.2.0] - 2026-10-10
 
 ### Changed
@@ -61,5 +69,6 @@ For those who ran a build from before this release:
 - `--no-commands` is still taken and does nothing, so that older service files keep starting. It cannot be given
   together with `--commands`.
 
+[0.2.1]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.1.0
