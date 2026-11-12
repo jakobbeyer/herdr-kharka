@@ -4,6 +4,18 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 the project follows [Semantic Versioning](https://semver.org/). Before 1.0, a minor release may still change what is
 written or how commands work; the notes say so when it does.
 
+## [0.3.2] - 2026-11-12
+
+### Changed
+
+- `focused` also names another machine's agent when the Herdr app shows it, as the app names it (`omarchy/t3`).
+  Before, the machine running the app wrote null then, and no record said which agent was in front. Machines without
+  the app still write null.
+- A change of focus is written within a fraction of a second: herdr-kharka asks the Herdr app which agent it shows
+  every 200 ms (a request of about 0.05 ms) and looks at once when it changes. Before, it was seen at the next
+  `--interval`, up to 3 s later, as neither the core nor the app reports it as an event. Without an app, it asks every
+  5 s.
+
 ## [0.3.1] - 2026-11-12
 
 The same code as 0.3.0, which was tagged but never released: its release workflow could not build for Apple Silicon,
@@ -98,6 +110,7 @@ For those who ran a build from before this release:
 - `--no-commands` is still taken and does nothing, so that older service files keep starting. It cannot be given
   together with `--commands`.
 
+[0.3.2]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.3.2
 [0.3.1]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.3.1
 [0.3.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.3.0
 [0.2.1]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.2.1
