@@ -1,6 +1,6 @@
 //! Commands for this machine's herdr, from any machine. A program writes the record `herdr.commands/<node>/<id>`
-//! (`{ from, at, expires, method, params }`); herdr-kharka on that node runs the method against its herdr and writes the
-//! answer into the same record (`done: { at, ok, result | error }`); the program reads it and deletes the record.
+//! (`{ from, at, expires, method, params }`); herdr-kharka on that node runs the method (see [`dispatch`]: against
+//! herdr-core, `agent.focus` against the Herdr app) and writes the answer into the same record (`done: { at, ok, result | error }`); the program reads it and deletes the record.
 //!
 //! Only the allowed methods run ([`DEFAULT_METHODS`] and the ones given to `--allow-method`), within the limits
 //! ([`LIMIT`] and the ones after it). A command without `expires`, or past it, is answered without running; an answered one that nobody deleted is
@@ -8,7 +8,7 @@
 //! comes again before its answer shows (the watch was opened again or fell behind).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -17,22 +17,36 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde_json::{Value, json};
 
+use crate::context::Transcripts;
 use crate::kharka::{Kharka, Refused, Seen, Socket, Watch};
-use crate::{Problems, herdr, now_ms};
+use crate::{Problems, hc, now_ms};
 
 pub const PREFIX: &str = "herdr.commands/";
-/// The methods that run without `--allow-method`: the ones herdr-deck sends (list, focus, rename, send keys) and herdr's
-/// other agent methods that only read, except `agent.wait`, which waits longer than a call may take. Not
-/// `agent.prompt`, `agent.start` or `agent.view.*`, and no method a later herdr adds: they run only when named.
-pub const DEFAULT_METHODS: [&str; 7] = [
-    "agent.explain",
+/// The methods that run without `--allow-method`: the ones that show or read an agent, and `agent.send_keys` (herdr-deck
+/// interrupts with `esc`). Not `agent.prompt`: it runs only when named.
+pub const DEFAULT_METHODS: [&str; 5] = [
     "agent.focus",
     "agent.get",
     "agent.list",
     "agent.read",
-    "agent.rename",
     "agent.send_keys",
 ];
+/// Every method herdr-kharka can run; `--allow-method` takes no other.
+pub const KNOWN_METHODS: [&str; 6] = [
+    "agent.focus",
+    "agent.get",
+    "agent.list",
+    "agent.prompt",
+    "agent.read",
+    "agent.send_keys",
+];
+
+/// Where the methods run: herdr-core, and the Herdr app for `agent.focus`.
+#[derive(Clone)]
+pub struct Sockets {
+    pub hc: PathBuf,
+    pub app: PathBuf,
+}
 /// The limits within `LIMIT_WINDOW`, on the calls that reached herdr: so many in total, so many per sender (`from`, which
 /// nobody checks: it holds back a sender that runs wild, not one that lies), and so much time herdr spent on them (a
 /// call takes up to 3 s, and they run one after another).
@@ -58,19 +72,13 @@ struct Run {
 /// comes again with the same stamp is answered again, not run again.
 type Ran = HashMap<String, Run>;
 
-/// A method `--allow-method` takes: `agent.` and one or more names joined by `.`, each a lower case letter followed by
-/// lower case letters, digits and `_`.
+/// A method `--allow-method` takes: one of [`KNOWN_METHODS`].
 pub fn method_name(text: &str) -> Result<String, String> {
-    let valid = text.strip_prefix("agent.").is_some_and(|name| {
-        name.split('.').all(|part| {
-            part.starts_with(|c: char| c.is_ascii_lowercase())
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        })
-    });
-    if !valid {
-        return Err(format!("only agent.* methods can be allowed, not {text:?}"));
+    if !KNOWN_METHODS.contains(&text) {
+        return Err(format!(
+            "only these methods can be allowed: {}, not {text:?}",
+            KNOWN_METHODS.join(", ")
+        ));
     }
     Ok(text.to_string())
 }
@@ -170,7 +178,11 @@ enum Answer {
 }
 
 /// Follows this node's commands in a thread of its own, for as long as herdr-kharka runs.
-pub fn spawn(kharka_socket: Socket, herdr_socket: PathBuf, allowed: Vec<String>, up: Up) {
+pub fn spawn(kharka_socket: Socket, hc_socket: PathBuf, app_socket: PathBuf, allowed: Vec<String>, up: Up) {
+    let sockets = Sockets {
+        hc: hc_socket,
+        app: app_socket,
+    };
     thread::spawn(move || {
         let mut problems = Problems::default();
         let mut pause = Duration::from_millis(250);
@@ -182,7 +194,7 @@ pub fn spawn(kharka_socket: Socket, herdr_socket: PathBuf, allowed: Vec<String>,
         loop {
             if let Err(err) = serve(
                 &kharka_socket,
-                &herdr_socket,
+                &sockets,
                 &mut ran,
                 &mut guard,
                 &up,
@@ -202,7 +214,7 @@ pub fn spawn(kharka_socket: Socket, herdr_socket: PathBuf, allowed: Vec<String>,
 /// One connection's worth: watches `herdr.commands/<node>/` until the connection fails.
 fn serve(
     kharka_socket: &Socket,
-    herdr_socket: &Path,
+    sockets: &Sockets,
     ran: &mut Ran,
     guard: &mut Guard,
     up: &Up,
@@ -233,7 +245,7 @@ fn serve(
                 if let (Some(current), Some(key)) = (&mut current, entry["key"].as_str()) {
                     current.insert(key.to_string());
                 }
-                take(&entry, herdr_socket, &mut writer, &mut answered, ran, guard)?;
+                take(&entry, sockets, &mut writer, &mut answered, ran, guard)?;
             }
             // what is not among the current entries was deleted while nobody watched
             Seen::Ready => {
@@ -251,7 +263,7 @@ fn serve(
 /// A command that came, changed or went: an open one is run and answered, an answered one remembered for the sweep.
 fn take(
     entry: &Value,
-    herdr_socket: &Path,
+    sockets: &Sockets,
     writer: &mut Kharka,
     answered: &mut HashMap<String, (String, u64)>,
     ran: &mut Ran,
@@ -276,7 +288,7 @@ fn take(
     let from = value["from"].as_str().unwrap_or("?");
     let again = ran.get(key).is_some_and(|run| run.hlc == hlc);
     if !again {
-        let done = match run(value, method, from, herdr_socket, guard) {
+        let done = match run(value, method, from, sockets, guard) {
             Ok(result) => json!({ "at": now_ms(), "ok": true, "result": result }),
             Err(error) => json!({ "at": now_ms(), "ok": false, "error": error }),
         };
@@ -312,7 +324,7 @@ fn take(
 }
 
 /// Runs the command: its result, or the error to answer with.
-fn run(value: &Value, method: &str, from: &str, herdr_socket: &Path, guard: &mut Guard) -> Result<Value, String> {
+fn run(value: &Value, method: &str, from: &str, sockets: &Sockets, guard: &mut Guard) -> Result<Value, String> {
     match (method, expires(value)) {
         ("", _) => Err("no method".to_string()),
         (_, Err(error)) => Err(error.to_string()),
@@ -325,16 +337,73 @@ fn run(value: &Value, method: &str, from: &str, herdr_socket: &Path, guard: &mut
                 json!({})
             };
             let started = Instant::now();
-            let result = herdr::call(herdr_socket, method, &params);
-            // one that did not reach herdr (it restarts) cost herdr nothing
+            let result = dispatch(sockets, method, &params);
+            // one that did not reach herdr-core (it restarts) cost it nothing
             if !result
                 .as_ref()
-                .is_err_and(|err| err.downcast_ref::<herdr::NoHerdr>().is_some())
+                .is_err_and(|err| err.downcast_ref::<hc::NoCore>().is_some())
             {
                 guard.count(from, started.elapsed(), Instant::now());
             }
             result.map_err(|err| format!("{err:#}"))
         }
+    }
+}
+
+/// Runs an allowed method: `agent.list` and `agent.get` from a look at herdr-core, `agent.read`, `agent.send_keys` and
+/// `agent.prompt` as herdr-core's `terminal.read`, `terminal.keys` and `terminal.send`, `agent.focus` as the Herdr
+/// app's. `target` is one of this machine's terminals (`t3`) or its name.
+fn dispatch(sockets: &Sockets, method: &str, params: &Value) -> anyhow::Result<Value> {
+    if method == "agent.list" {
+        let look = hc::look(&sockets.hc, &sockets.app, &mut Transcripts::default())?;
+        return Ok(json!({ "agents": look.agents }));
+    }
+    let target = params["target"]
+        .as_str()
+        .filter(|target| hc::is_local(target))
+        .ok_or_else(|| anyhow::anyhow!("{method}: target must be one of this machine's terminals, e.g. t3"))?;
+    match method {
+        "agent.get" => {
+            let look = hc::look(&sockets.hc, &sockets.app, &mut Transcripts::default())?;
+            let agent = look
+                .agents
+                .into_iter()
+                .find(|agent| agent["pane"] == target || agent["name"] == target)
+                .ok_or_else(|| anyhow::anyhow!("{method}: no agent {target:?}"))?;
+            Ok(json!({ "agent": agent }))
+        }
+        "agent.read" => {
+            let lines = params["lines"].as_u64().unwrap_or(0);
+            hc::call(
+                &sockets.hc,
+                "terminal.read",
+                &json!({ "terminal": target, "lines": lines }),
+            )
+        }
+        "agent.send_keys" => {
+            let keys = params["keys"]
+                .as_array()
+                .filter(|keys| !keys.is_empty() && keys.iter().all(Value::is_string))
+                .ok_or_else(|| anyhow::anyhow!("{method}: keys must be a list of key names"))?;
+            hc::call(
+                &sockets.hc,
+                "terminal.keys",
+                &json!({ "terminal": target, "keys": keys }),
+            )
+        }
+        "agent.prompt" => {
+            let text = ["text", "prompt"]
+                .iter()
+                .find_map(|field| params[field].as_str())
+                .ok_or_else(|| anyhow::anyhow!("{method}: text is missing"))?;
+            hc::call(
+                &sockets.hc,
+                "terminal.send",
+                &json!({ "terminal": target, "text": text }),
+            )
+        }
+        "agent.focus" => hc::app_do(&sockets.app, "agent.focus", &json!({ "terminal": target })),
+        _ => anyhow::bail!("{method}: herdr-kharka cannot run it"),
     }
 }
 
@@ -491,8 +560,8 @@ mod tests {
     }
 
     #[test]
-    fn only_agent_methods_can_be_allowed() {
-        for name in ["agent.prompt", "agent.view.set", "agent.send_keys", "agent.v2"] {
+    fn only_known_methods_can_be_allowed() {
+        for name in KNOWN_METHODS {
             assert_eq!(method_name(name), Ok(name.to_string()));
         }
         for refused in [
@@ -501,13 +570,8 @@ mod tests {
             "agent",
             "agent.Prompt",
             "agent.prompt\n",
-            "xagent.list",
-            "agent..",
-            "agent._",
-            "agent.1",
-            "agent.view.",
-            "agent.view..set",
-            "agent.view._x",
+            "agent.rename",
+            "agent.wait",
         ] {
             assert!(method_name(refused).is_err(), "{refused}");
         }

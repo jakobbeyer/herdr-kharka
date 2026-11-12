@@ -1,13 +1,14 @@
 //! herdr-kharka: writes what this machine's herdr runs into kharka, whenever it changes.
 //!
-//! It looks at herdr when herdr reports an event, and every `--interval` anyway, and writes `herdr/<node>` to the local
+//! herdr here is the Herdr app's core, herdr-core (`hc`), which runs every terminal and agent. herdr-kharka looks at it
+//! when it reports an event, and every `--interval` anyway, and writes `herdr/<node>` to the local
 //! kharka daemon when the state changed, or every `--heartbeat` so readers can tell it is current. kharka carries it to
 //! every other machine. With `--commands` it also runs the allowed `agent.*` commands other machines write for this one
 //! (see [`commands`]).
 
 mod commands;
 mod context;
-mod herdr;
+mod hc;
 mod kharka;
 mod service;
 
@@ -21,7 +22,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use context::Transcripts;
-use herdr::Events;
+use hc::Events;
 use kharka::{Kharka, Refused};
 
 /// herdr is written as offline after this many failed looks in a row, or after failing this long; at once only when its
@@ -33,16 +34,21 @@ const OFFLINE_AFTER: Duration = Duration::from_secs(10);
 #[derive(Parser)]
 #[command(version, about, max_term_width = 110, args_conflicts_with_subcommands = true)]
 struct Cli {
-    /// herdr's socket [default: $HERDR_SOCKET_PATH, else ~/.config/herdr/herdr.sock]
+    /// herdr-core's socket [default: $HC_SOCKET, else $XDG_RUNTIME_DIR/herdr-core/default.sock, else
+    /// ~/.local/state/herdr-core/default/default.sock]
     #[arg(long)]
-    herdr_socket: Option<PathBuf>,
+    hc_socket: Option<PathBuf>,
+    /// The Herdr app's socket, for the focused agent and agent.focus [default: $HERDR_APP_HOME/herdr-app.sock, else
+    /// ~/.config/herdr-app/herdr-app.sock]
+    #[arg(long)]
+    app_socket: Option<PathBuf>,
     /// The kharka daemon's socket [default: kharka's own default]
     #[arg(long, env = "KHARKA_SOCKET")]
     kharka_socket: Option<PathBuf>,
     /// The key to write; {node} becomes the kharka daemon's node name
     #[arg(long, default_value = "herdr/{node}")]
     key: String,
-    /// The machine's name for people and for readers such as bhote [default: the kharka daemon's node name]
+    /// The machine's name for people and for readers such as herdr-deck [default: the kharka daemon's node name]
     #[arg(long)]
     label: Option<String>,
     /// The longest time between two looks at herdr
@@ -51,9 +57,6 @@ struct Cli {
     /// An unchanged state is written again after this long
     #[arg(long, default_value = "10s", value_parser = duration)]
     heartbeat: Duration,
-    /// A pane token to leave out, e.g. an animation that would cause a write every second (repeatable)
-    #[arg(long = "ignore-token", default_value = "spin")]
-    ignore_tokens: Vec<String>,
     /// Look once, write, and end
     #[arg(long)]
     once: bool,
@@ -121,7 +124,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         eprintln!("Install it:\n{}", service::instructions());
         return Ok(());
     }
-    let herdr_socket = cli.herdr_socket.unwrap_or_else(herdr::default_socket);
+    let hc_socket = cli.hc_socket.unwrap_or_else(hc::default_socket);
+    let app_socket = cli.app_socket.unwrap_or_else(hc::default_app_socket);
     let kharka_socket = cli.kharka_socket.map_or(kharka::Socket::Default, kharka::Socket::Given);
     let (wake, woken) = mpsc::channel::<()>();
     let allowed = commands::allowed(&cli.allow_methods);
@@ -136,7 +140,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let taking = commands::Up::new(wake.clone());
             commands::spawn(
                 kharka_socket.clone(),
-                herdr_socket.clone(),
+                hc_socket.clone(),
+                app_socket.clone(),
                 allowed.clone(),
                 taking.clone(),
             );
@@ -145,7 +150,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             eprintln!("herdr-kharka: commands are off (--commands runs them)");
         }
     }
-    let mut herdr = Watcher::new(herdr_socket, cli.ignore_tokens);
+    let mut herdr = Watcher::new(hc_socket, app_socket);
     let mut collector = Collector {
         kharka_socket,
         key_pattern: cli.key,
@@ -169,12 +174,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             Some(up) if up.get() => json!(allowed),
             _ => json!([]),
         };
-        events.follow(&herdr.socket, &herdr.panes, &wake);
+        events.follow(&herdr.socket, &wake);
         match events.problem() {
-            Some(problem) => collector
-                .problems
-                .report("herdr events", &format!("{problem} (looking every {:?})", cli.interval)),
-            None => collector.problems.clear("herdr events"),
+            Some(problem) => collector.problems.report(
+                "herdr-core events",
+                &format!("{problem} (looking every {:?})", cli.interval),
+            ),
+            None => collector.problems.clear("herdr-core events"),
         }
         collector.offer(&state, cli.heartbeat);
         // an event, the interval, or a subscription that is due again; events come in bursts, so wait a moment and
@@ -204,15 +210,13 @@ fn check_service(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// herdr as the collector sees it, look by look.
+/// herdr-core as the collector sees it, look by look.
 struct Watcher {
     socket: PathBuf,
-    ignore_tokens: Vec<String>,
+    app_socket: PathBuf,
     transcripts: Transcripts,
     /// The state of the last good look; kept through a short failure, dropped when herdr is written as offline.
     last: Option<Value>,
-    /// The agent panes of the last good look, whose events are followed.
-    panes: Vec<String>,
     failures: u32,
     failing_since: Option<Instant>,
     /// The focused pane of the last good look; `None` before the first.
@@ -222,13 +226,12 @@ struct Watcher {
 }
 
 impl Watcher {
-    fn new(socket: PathBuf, ignore_tokens: Vec<String>) -> Watcher {
+    fn new(socket: PathBuf, app_socket: PathBuf) -> Watcher {
         Watcher {
             socket,
-            ignore_tokens,
+            app_socket,
             transcripts: Transcripts::default(),
             last: None,
-            panes: Vec::new(),
             failures: 0,
             failing_since: None,
             focused: None,
@@ -239,20 +242,19 @@ impl Watcher {
     /// The state to write.
     fn look(&mut self, problems: &mut Problems) -> Value {
         let host = gethostname::gethostname().to_string_lossy().into_owned();
-        match herdr::look(&self.socket, &self.ignore_tokens, &mut self.transcripts) {
+        match hc::look(&self.socket, &self.app_socket, &mut self.transcripts) {
             Ok(look) => {
-                problems.clear("herdr");
+                problems.clear("herdr-core");
                 self.failures = 0;
                 self.failing_since = None;
                 if self.focused.as_ref().is_some_and(|focused| *focused != look.focused) {
                     self.focus_changed = Some(now_ms());
                 }
                 self.focused = Some(look.focused.clone());
-                self.panes = look.panes;
                 let state = json!({
                     "host": host,
                     "herdr": "online",
-                    "origin_machine_id": look.origin_machine_id,
+                    "origin_machine_id": null,
                     "focused": look.focused,
                     "focus_changed": self.focus_changed,
                     "workspaces": look.workspaces,
@@ -262,7 +264,7 @@ impl Watcher {
                 state
             }
             Err(err) => {
-                problems.report("herdr", &format!("{err:#}"));
+                problems.report("herdr-core", &format!("{err:#}"));
                 self.failures += 1;
                 let failing_since = *self.failing_since.get_or_insert_with(Instant::now);
                 let gone = !self.socket.exists()

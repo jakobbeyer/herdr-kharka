@@ -6,17 +6,31 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// The end of a transcript that is read for the last usage.
 const TAIL_BYTES: u64 = 256 * 1024;
 
-/// The Claude session of an agent, when herdr knows its id.
-pub fn session_of(agent: &Map<String, Value>) -> Option<String> {
-    let session = agent.get("agent_session")?;
-    let id = session["value"].as_str()?;
-    let valid = session["kind"] == "id" && id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
-    valid.then(|| id.to_string())
+/// The Claude session a process runs: Claude Code writes `<home>/.claude*/sessions/<pid>.json` with its `sessionId`.
+pub fn session_of_pid(pid: u64) -> Option<String> {
+    session_in(&PathBuf::from(std::env::var_os("HOME")?), pid)
+}
+
+fn session_in(home: &Path, pid: u64) -> Option<String> {
+    let file = format!("{pid}.json");
+    fs::read_dir(home).ok()?.flatten().find_map(|config| {
+        if !config.file_name().to_string_lossy().starts_with(".claude") {
+            return None;
+        }
+        let text = fs::read_to_string(config.path().join("sessions").join(&file)).ok()?;
+        let session: Value = serde_json::from_str(&text).ok()?;
+        if session["pid"].as_u64() != Some(pid) {
+            return None;
+        }
+        let id = session["sessionId"].as_str()?;
+        let valid = id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+        valid.then(|| id.to_string())
+    })
 }
 
 /// The transcripts found so far, by session, and what was read from each: a transcript is read again only when its size
@@ -112,7 +126,6 @@ fn number_after(text: &str, label: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn context_from_the_last_main_thread_usage() {
@@ -127,14 +140,20 @@ mod tests {
     }
 
     #[test]
-    fn sessions_with_an_id() {
-        let agent = json!({ "agent_session": { "kind": "id", "value": "0b7e2c4a-5d1f-4e8b-9a36-2f4c8d1e7a90" } });
-        assert_eq!(
-            session_of(agent.as_object().unwrap()).as_deref(),
-            Some("0b7e2c4a-5d1f-4e8b-9a36-2f4c8d1e7a90")
-        );
-        let other = json!({ "agent_session": { "kind": "name", "value": "x" } });
-        assert_eq!(session_of(other.as_object().unwrap()), None);
+    fn the_session_of_a_claude_process() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".claude2/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let id = "0b7e2c4a-5d1f-4e8b-9a36-2f4c8d1e7a90";
+        fs::write(
+            sessions.join("4242.json"),
+            format!(r#"{{"pid":4242,"sessionId":"{id}"}}"#),
+        )
+        .unwrap();
+        fs::write(sessions.join("7.json"), r#"{"pid":7,"sessionId":"not-an-id"}"#).unwrap();
+        assert_eq!(session_in(home.path(), 4242).as_deref(), Some(id));
+        assert_eq!(session_in(home.path(), 7), None);
+        assert_eq!(session_in(home.path(), 8), None);
     }
 
     #[test]

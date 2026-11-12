@@ -4,6 +4,23 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 the project follows [Semantic Versioning](https://semver.org/). Before 1.0, a minor release may still change what is
 written or how commands work; the notes say so when it does.
 
+## [Unreleased]
+
+### Changed
+
+- **Reads herdr-core (`hc`), the core of the Herdr app, instead of herdr's TUI.** Agents are this machine's terminals
+  whose program reports a status, workspaces the app's spaces. `--herdr-socket` is gone; `--hc-socket` (default
+  `$HC_SOCKET`, else `$XDG_RUNTIME_DIR/herdr-core/default.sock`, else `~/.local/state/herdr-core/default/default.sock`)
+  and `--app-socket` (the Herdr app's) take its place. `--ignore-token` is gone: herdr-core has no tokens.
+- What is written keeps its shape, with herdr-core's values: `pane` and `terminal_id` are the terminal's address
+  (`t5`), `workspace` and `tab` the app's ids, `agent` the program that reports the status (`claude-code`);
+  `origin_machine_id` is null, `display_agent` is gone, `tokens` is empty. `focused` is the agent the Herdr app shows,
+  where it runs.
+- Commands run against herdr-core: `agent.read`, `agent.send_keys` and `agent.prompt` as `terminal.read`,
+  `terminal.keys` and `terminal.send`, `agent.list` and `agent.get` from a look, `agent.focus` through the Herdr app.
+  `agent.rename` and `agent.explain` are gone, and `--allow-method` takes only `agent.prompt` beyond the defaults.
+- The Claude session of an agent comes from Claude Code's `~/.claude*/sessions/<pid>.json`.
+
 ## [0.2.1] - 2026-10-13
 
 ### Fixed
