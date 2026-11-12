@@ -4,7 +4,10 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 the project follows [Semantic Versioning](https://semver.org/). Before 1.0, a minor release may still change what is
 written or how commands work; the notes say so when it does.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-12
+
+Needs herdr-core (`hc`), the core of the Herdr app (tested with hc 0.1.18 and 0.1.20); herdr's TUI is no longer read.
+kharka 0.1.0 or newer, as before. Service files keep working unless they name `--herdr-socket` or `--ignore-token`.
 
 ### Changed
 
@@ -86,6 +89,7 @@ For those who ran a build from before this release:
 - `--no-commands` is still taken and does nothing, so that older service files keep starting. It cannot be given
   together with `--commands`.
 
+[0.3.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.3.0
 [0.2.1]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jakobbeyer/herdr-kharka/releases/tag/v0.1.0
