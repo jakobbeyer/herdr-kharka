@@ -166,6 +166,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         let state = herdr.look(&mut Problems::default());
         return collector.write(&state);
     }
+    hc::watch_focus(herdr.app_socket.clone(), wake.clone());
     let mut events = Events::default();
     loop {
         let mut state = herdr.look(&mut collector.problems);

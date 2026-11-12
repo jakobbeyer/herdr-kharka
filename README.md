@@ -118,8 +118,8 @@ herdr-core's API objects, so that readers do not break when herdr changes:
 |---|---|
 | `label` | the machine's name for people and readers such as herdr-deck (`--label`, else the node name) |
 | `origin_machine_id` | always null since 0.3.0 (herdr's TUI reported one) |
-| `focused` | the agent the Herdr app shows, if the app runs on this machine and shows one of its agents |
-| `focus_changed` | when herdr-kharka last saw `focused` change (ms), else null: which machine is in use right now |
+| `focused` | the agent the Herdr app shows, if the app runs on this machine: one of this machine's by its address (`t5`), another machine's as the app names it (`omarchy/t3`); null on machines without the app |
+| `focus_changed` | when herdr-kharka last saw `focused` change (ms), else null |
 | `commands` | the methods this machine takes from other machines, see [Commands](#commands); else empty |
 | `workspaces` | the Herdr app's spaces on this machine, in its order (`number`): the name given, else where its terminals are (as the app calls it), else its folder; `tokens` stays empty |
 | `pane`, `terminal_id` | the agent's terminal address in herdr-core (`t5`); other machines reach it as `<machine>/t5` |

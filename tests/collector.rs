@@ -654,11 +654,40 @@ fn a_change_of_focus_is_stamped() {
     let stamp = changed["focus_changed"].as_u64().expect("a time");
     assert!(stamp >= before && stamp < before + 5000);
 
-    // the app shows another machine's agent: none of this one's is focused
+    // the app shows another machine's agent: written as the app names it
     herdr.set_focused(Some("other/t1"));
     herdr.send_event();
     let (_, elsewhere) = puts.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(elsewhere["focused"], Value::Null);
+    assert_eq!(elsewhere["focused"], "other/t1");
+    assert!(elsewhere["focus_changed"].as_u64().unwrap() >= stamp);
+
+    // a terminal of this machine that is not an agent is not written
+    herdr.set_focused(Some("t9"));
+    herdr.send_event();
+    let (_, none) = puts.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(none["focused"], Value::Null);
+}
+
+#[test]
+fn a_change_of_focus_is_written_without_an_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start(dir.path(), json!([agent("t1", "working"), agent("t2", "idle")]));
+    let (kharka, puts) = fake_kharka(dir.path());
+    let _running = Killed(
+        collector(&herdr.socket, &kharka, &["--interval", "60s", "--heartbeat", "60s"])
+            .spawn()
+            .unwrap(),
+    );
+    let (_, first) = puts.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first["focused"], "t1");
+    herdr.wait_subscribed();
+    // the app shows another agent; the core reports nothing, the interval is a minute away
+    thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    herdr.set_focused(Some("other/t3"));
+    let (_, changed) = puts.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(changed["focused"], "other/t3");
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
 }
 
 #[test]

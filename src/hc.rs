@@ -58,7 +58,7 @@ fn home() -> PathBuf {
 pub struct Look {
     pub agents: Vec<Value>,
     pub workspaces: Vec<Value>,
-    /// The agent the Herdr app shows, if it runs here and shows one of this machine's agents.
+    /// The agent the Herdr app shows, if it runs here: one of this machine's (`t5`) or another machine's (`omarchy/t3`).
     pub focused: Option<String>,
 }
 
@@ -80,10 +80,12 @@ pub fn look(socket: &Path, app_socket: &Path, transcripts: &mut Transcripts) -> 
     let layout = call(socket, "doc.get", &json!({ "name": LAYOUT_DOC })).unwrap_or(Value::Null);
     let workspaces = workspaces(&layout["value"], &terminals);
     let agents: Vec<Value> = terminals.iter().filter_map(|raw| agent(raw, transcripts)).collect();
+    // the app shows one agent of all its machines: one of this machine's by its address (`t5`), another machine's as
+    // the app names it (`omarchy/t3`), so that the machine running the app tells readers about both
     let focused = app_status(app_socket)
         .ok()
         .and_then(|status| status["agent"].as_str().map(str::to_string))
-        .filter(|address| agents.iter().any(|agent| agent["pane"] == address.as_str()));
+        .filter(|address| !is_local(address) || agents.iter().any(|agent| agent["pane"] == address.as_str()));
     Ok(Look {
         agents,
         workspaces,
@@ -229,6 +231,36 @@ fn error_text(error: &Value) -> String {
         Some(kind) if !message.contains(kind) => format!("{message} ({kind})"),
         _ => message,
     }
+}
+
+/// How often the Herdr app is asked which agent it shows: a change of focus is no event of the core, and the app has
+/// none to follow.
+const FOCUS_POLL: Duration = Duration::from_millis(200);
+/// How long to wait before asking again when no app answers (none runs on this machine, or it is closed).
+const FOCUS_POLL_IDLE: Duration = Duration::from_secs(5);
+
+/// Asks the Herdr app on its socket which agent it shows, every [`FOCUS_POLL`], and wakes the collector when that
+/// changes, so that `focused` is written at once rather than at the next interval. Ends when the collector is gone.
+pub fn watch_focus(app_socket: PathBuf, wake: mpsc::Sender<()>) {
+    thread::spawn(move || {
+        let mut last: Option<Value> = None;
+        loop {
+            match app_status(&app_socket) {
+                Ok(status) => {
+                    let agent = status["agent"].clone();
+                    if last.as_ref().is_some_and(|last| *last != agent) && wake.send(()).is_err() {
+                        return;
+                    }
+                    last = Some(agent);
+                    thread::sleep(FOCUS_POLL);
+                }
+                Err(_) => {
+                    last = None;
+                    thread::sleep(FOCUS_POLL_IDLE);
+                }
+            }
+        }
+    });
 }
 
 /// What the Herdr app shows (`{ status }` on its socket): the space, the focused pane, the agent.
