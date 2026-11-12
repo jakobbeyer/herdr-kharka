@@ -21,3 +21,7 @@ publish-jobs = ["homebrew"]
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+
+# GitHub retired macos-14, dist's default runner for Apple Silicon
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
